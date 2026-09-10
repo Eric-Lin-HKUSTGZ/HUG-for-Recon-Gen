@@ -1,0 +1,362 @@
+nohup: ignoring input
+1000 sequences found
+Traceback (most recent call last):
+  File "/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py", line 180, in <module>
+    tyro.cli(main)
+  File "/root/code/vepfs/miniconda3/envs/hug/lib/python3.10/site-packages/tyro/_cli.py", line 322, in cli
+    out = run_with_args_from_cli()
+  File "/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py", line 156, in main
+    meta, pose_m, betas, cams = load_sequence(seq_dir)
+  File "/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py", line 74, in load_sequence
+    intr = yaml.unsafe_load(open(cal / "intrinsics" / f"{serial}_640x480.yml"))
+  File "/root/code/vepfs/miniconda3/envs/hug/lib/python3.10/site-packages/yaml/__init__.py", line 145, in unsafe_load
+    return load(stream, UnsafeLoader)
+  File "/root/code/vepfs/miniconda3/envs/hug/lib/python3.10/site-packages/yaml/__init__.py", line 81, in load
+    return loader.get_single_data()
+  File "/root/code/vepfs/miniconda3/envs/hug/lib/python3.10/site-packages/yaml/constructor.py", line 49, in get_single_data
+    node = self.get_single_node()
+  File "/root/code/vepfs/miniconda3/envs/hug/lib/python3.10/site-packages/yaml/composer.py", line 36, in get_single_node
+    document = self.compose_document()
+  File "/root/code/vepfs/miniconda3/envs/hug/lib/python3.10/site-packages/yaml/composer.py", line 55, in compose_document
+    node = self.compose_node(None, None)
+  File "/root/code/vepfs/miniconda3/envs/hug/lib/python3.10/site-packages/yaml/composer.py", line 84, in compose_node
+    node = self.compose_mapping_node(anchor)
+  File "/root/code/vepfs/miniconda3/envs/hug/lib/python3.10/site-packages/yaml/composer.py", line 133, in compose_mapping_node
+    item_value = self.compose_node(node, item_key)
+  File "/root/code/vepfs/miniconda3/envs/hug/lib/python3.10/site-packages/yaml/composer.py", line 82, in compose_node
+    node = self.compose_sequence_node(anchor)
+  File "/root/code/vepfs/miniconda3/envs/hug/lib/python3.10/site-packages/yaml/composer.py", line 110, in compose_sequence_node
+    while not self.check_event(SequenceEndEvent):
+  File "/root/code/vepfs/miniconda3/envs/hug/lib/python3.10/site-packages/yaml/parser.py", line 98, in check_event
+    self.current_event = self.state()
+  File "/root/code/vepfs/miniconda3/envs/hug/lib/python3.10/site-packages/yaml/parser.py", line 403, in parse_indentless_sequence_entry
+    if self.check_token(BlockEntryToken):
+  File "/root/code/vepfs/miniconda3/envs/hug/lib/python3.10/site-packages/yaml/scanner.py", line 116, in check_token
+    self.fetch_more_tokens()
+  File "/root/code/vepfs/miniconda3/envs/hug/lib/python3.10/site-packages/yaml/scanner.py", line 162, in fetch_more_tokens
+    self.stale_possible_simple_keys()
+  File "/root/code/vepfs/miniconda3/envs/hug/lib/python3.10/site-packages/yaml/scanner.py", line 286, in stale_possible_simple_keys
+    for level in list(self.possible_simple_keys):
+KeyboardInterrupt
+1000 sequences found
+converting 508384 DexYCB frames -> 
+/root/code/vepfs/dataset/hand_recon_hug/dexycb
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+/root/code/HUG-for-Recon-Gen/scripts/convert_dexycb.py:53: DeprecationWarning: Please import `csc_matrix` from the `scipy.sparse` namespace; the `scipy.sparse.csc` namespace is deprecated and will be removed in SciPy 2.0.0.
+  d = pickle.load(f, encoding="latin1")
+  2000/508384
+  4000/508384
+  6000/508384
+  8000/508384
+  10000/508384
+  12000/508384
+  14000/508384
+  16000/508384
+  18000/508384
+  20000/508384
+  22000/508384
+  24000/508384
+  26000/508384
+  28000/508384
+  30000/508384
+  32000/508384
+  34000/508384
+  36000/508384
+  38000/508384
+  40000/508384
+  42000/508384
+  44000/508384
+  46000/508384
+  48000/508384
+  50000/508384
+  52000/508384
+  54000/508384
+  56000/508384
+  58000/508384
+  60000/508384
+  62000/508384
+  64000/508384
+  66000/508384
+  68000/508384
+  70000/508384
+  72000/508384
+  74000/508384
+  76000/508384
+  78000/508384
+  80000/508384
+  82000/508384
+  84000/508384
+  86000/508384
+  88000/508384
+  90000/508384
+  92000/508384
+  94000/508384
+  96000/508384
+  98000/508384
+  100000/508384
+  102000/508384
+  104000/508384
+  106000/508384
+  108000/508384
+  110000/508384
+  112000/508384
+  114000/508384
+  116000/508384
+  118000/508384
+  120000/508384
+  122000/508384
+  124000/508384
+  126000/508384
+  128000/508384
+  130000/508384
+  132000/508384
+  134000/508384
+  136000/508384
+  138000/508384
+  140000/508384
+  142000/508384
+  144000/508384
+  146000/508384
+  148000/508384
+  150000/508384
+  152000/508384
+  154000/508384
+  156000/508384
+  158000/508384
+  160000/508384
+  162000/508384
+  164000/508384
+  166000/508384
+  168000/508384
+  170000/508384
+  172000/508384
+  174000/508384
+  176000/508384
+  178000/508384
+  180000/508384
+  182000/508384
+  184000/508384
+  186000/508384
+  188000/508384
+  190000/508384
+  192000/508384
+  194000/508384
+  196000/508384
+  198000/508384
+  200000/508384
+  202000/508384
+  204000/508384
+  206000/508384
+  208000/508384
+  210000/508384
+  212000/508384
+  214000/508384
+  216000/508384
+  218000/508384
+  220000/508384
+  222000/508384
+  224000/508384
+  226000/508384
+  228000/508384
+  230000/508384
+  232000/508384
+  234000/508384
+  236000/508384
+  238000/508384
+  240000/508384
+  242000/508384
+  244000/508384
+  246000/508384
+  248000/508384
+  250000/508384
+  252000/508384
+  254000/508384
+  256000/508384
+  258000/508384
+  260000/508384
+  262000/508384
+  264000/508384
+  266000/508384
+  268000/508384
+  270000/508384
+  272000/508384
+  274000/508384
+  276000/508384
+  278000/508384
+  280000/508384
+  282000/508384
+  284000/508384
+  286000/508384
+  288000/508384
+  290000/508384
+  292000/508384
+  294000/508384
+  296000/508384
+  298000/508384
+  300000/508384
+  302000/508384
+  304000/508384
+  306000/508384
+  308000/508384
+  310000/508384
+  312000/508384
+  314000/508384
+  316000/508384
+  318000/508384
+  320000/508384
+  322000/508384
+  324000/508384
+  326000/508384
+  328000/508384
+  330000/508384
+  332000/508384
+  334000/508384
+  336000/508384
+  338000/508384
+  340000/508384
+  342000/508384
+  344000/508384
+  346000/508384
+  348000/508384
+  350000/508384
+  352000/508384
+  354000/508384
+  356000/508384
+  358000/508384
+  360000/508384
+  362000/508384
+  364000/508384
+  366000/508384
+  368000/508384
+  370000/508384
+  372000/508384
+  374000/508384
+  376000/508384
+  378000/508384
+  380000/508384
+  382000/508384
+  384000/508384
+  386000/508384
+  388000/508384
+  390000/508384
+  392000/508384
+  394000/508384
+  396000/508384
+  398000/508384
+  400000/508384
+  402000/508384
+  404000/508384
+  406000/508384
+  408000/508384
+  410000/508384
+  412000/508384
+  414000/508384
+  416000/508384
+  418000/508384
+  420000/508384
+  422000/508384
+  424000/508384
+  426000/508384
+  428000/508384
+  430000/508384
+  432000/508384
+  434000/508384
+  436000/508384
+  438000/508384
+  440000/508384
+  442000/508384
+  444000/508384
+  446000/508384
+  448000/508384
+  450000/508384
+  452000/508384
+  454000/508384
+  456000/508384
+  458000/508384
+  460000/508384
+  462000/508384
+  464000/508384
+  466000/508384
+  468000/508384
+  470000/508384
+  472000/508384
+  474000/508384
+  476000/508384
+  478000/508384
+  480000/508384
+  482000/508384
+  484000/508384
+  486000/508384
+  488000/508384
+  490000/508384
+  492000/508384
+  494000/508384
+  496000/508384
+  498000/508384
+  500000/508384
+  502000/508384
+  504000/508384
+  506000/508384
+  508000/508384
+done: 508384 frames processed

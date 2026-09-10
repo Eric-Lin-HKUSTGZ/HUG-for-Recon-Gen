@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from rich.console import Console
 
+from ..utils.camera_geometry import backproject_pixels_torch
 from ..utils.data_keys import MANO_RIGHT_SHAPE_FILE, NORM_STATS_FILE
 from .encoders import DINOv2Encoder, PointNeXtEncoder
 from .fusion import PatchFusion
@@ -23,6 +24,11 @@ class GraspFlowModel(nn.Module):
     def __init__(self, cfg, norm_stats=None):
         super().__init__()
         model_cfg = cfg.trainer.model
+        self.d_mano = int(model_cfg.get("d_mano", 99))
+        if self.d_mano not in (99, 109):
+            raise ValueError(
+                f"d_mano must be 99 (legacy) or 109 (learnable MANO shape), got {self.d_mano}"
+            )
         self.use_rgb = model_cfg.get("use_rgb", True)
         self.use_depth = model_cfg.get("use_depth", True)
         self.use_2d_point = model_cfg.get("use_2d_point", False)
@@ -89,6 +95,11 @@ class GraspFlowModel(nn.Module):
             image_size=model_cfg.get("image_size", 224),
             fourier_scale=model_cfg.get("fourier_scale", 1.0),
             use_2d_point=self.use_2d_point,
+            # Missing in old configs by design: they retain exact legacy
+            # query-fusion semantics when evaluating existing checkpoints.
+            query_fusion_mode=model_cfg.get(
+                "query_fusion_mode", "legacy_broadcast"
+            ),
         )
 
         d_cond = d_fusion
@@ -102,7 +113,7 @@ class GraspFlowModel(nn.Module):
         self.mesh_faces = self.mano.mano_layer.get_mano_closed_faces().cpu().numpy()
 
         self.flow = GraspFlowMatching(
-            d_mano=model_cfg.d_mano,
+            d_mano=self.d_mano,
             d_cond=d_cond,
             d_model=model_cfg.d_model,
             n_layers=model_cfg.flow_layers,
@@ -115,16 +126,7 @@ class GraspFlowModel(nn.Module):
     @staticmethod
     def _backproject(point_uv: torch.Tensor, camera_K: torch.Tensor) -> torch.Tensor:
         """Backproject (u, v, d) → metric (x, y, z) using K. Pure geometric op."""
-        u = point_uv[:, 0]
-        v = point_uv[:, 1]
-        d = point_uv[:, 2]
-        fx = camera_K[:, 0, 0]
-        fy = camera_K[:, 1, 1]
-        cx = camera_K[:, 0, 2]
-        cy = camera_K[:, 1, 2]
-        x = (u - cx) * d / fx
-        y = (v - cy) * d / fy
-        return torch.stack([x, y, d], dim=-1)
+        return backproject_pixels_torch(point_uv, camera_K)
 
     def encode_scene(
         self,
@@ -176,10 +178,30 @@ class GraspFlowModel(nn.Module):
         return cond
 
     def mano_forward(self, mano_params, betas=None):
-        """Run MANO and return landmarks + rotations in camera frame."""
+        """Run MANO and return landmarks + rotations in camera frame.
+
+        In 109D mode the trailing ten entries are used as per-sample MANO
+        shape coefficients. In legacy 99D mode the historical fixed shape is
+        retained when ``betas`` is omitted.
+        """
+        if betas is None:
+            betas = self.get_betas(mano_params)
         out = self.mano(mano_params, betas=betas)
-        out["landmarks_3d"] = out["landmarks_3d"] + out["t"].unsqueeze(1)
+        t = out["t"].unsqueeze(1)
+        out["landmarks_3d"] = out["landmarks_3d"] + t
+        out["vertices"] = out["vertices"] + t
         return out
+
+    def get_betas(self, mano_params: torch.Tensor) -> torch.Tensor:
+        """Return per-sample shape coefficients, with a 99D fallback.
+
+        The fallback keeps old checkpoints and old 99D configs operational,
+        while a 109D prediction remains differentiable with respect to shape.
+        """
+        if mano_params.shape[-1] >= 109:
+            return mano_params[..., 99:109]
+        expand_shape = (*mano_params.shape[:-1], 10)
+        return self.fixed_betas.expand(expand_shape)
 
     def _build_dicts(
         self,
@@ -189,19 +211,67 @@ class GraspFlowModel(nn.Module):
         gt_mano_params,
     ):
         """Build pred/target dicts from predicted and GT mano params."""
-        betas = self.fixed_betas.expand(pred_mano_params.shape[0], -1)
-        pred_out = self.mano_forward(pred_mano_params, betas=betas)
+        pred_out = self.mano_forward(pred_mano_params)
         preds = {
             "params_norm": params_norm_pred,
+            "mano_params": pred_mano_params,
+            "t": pred_out["t"],
+            "R_3x3": pred_out["R_3x3"],
             "landmarks_3d": pred_out["landmarks_3d"],
+            "vertices": pred_out["vertices"],
         }
 
-        gt_out = self.mano_forward(gt_mano_params, betas=betas)
+        gt_out = self.mano_forward(gt_mano_params)
         targets = {
             "params_norm": params_norm_target,
+            "mano_params": gt_mano_params,
+            "t": gt_out["t"],
+            "R_3x3": gt_out["R_3x3"],
             "landmarks_3d": gt_out["landmarks_3d"],
+            "vertices": gt_out["vertices"],
         }
         return preds, targets
+
+    def load_compatible_state_dict(self, state_dict):
+        """Load matching weights across the legacy 99D/new 109D models.
+
+        The only shape mismatch between the two denoisers is the token-type
+        table (3 vs 4 rows). Existing translation/wrist/finger rows are copied
+        and the new shape row/heads remain at their constructor initialization.
+        Unexpected keys (e.g. the new shape heads when loading into a legacy
+        model) are ignored. Other mismatches are reported and skipped rather
+        than silently reshaping tensors.
+        """
+        current = self.state_dict()
+        compatible = {}
+        skipped = []
+        for raw_key, value in state_dict.items():
+            if raw_key == "n_averaged":
+                continue
+            key = raw_key[len("module.") :] if raw_key.startswith("module.") else raw_key
+            if key not in current:
+                skipped.append((key, "unexpected"))
+                continue
+            target = current[key]
+            value = value.to(device=target.device, dtype=target.dtype)
+            if value.shape == target.shape:
+                compatible[key] = value
+                continue
+            if (
+                key.endswith("token_type_emb")
+                and value.ndim == target.ndim == 2
+                and value.shape[1] == target.shape[1]
+            ):
+                merged = target.detach().clone()
+                rows = min(value.shape[0], target.shape[0])
+                merged[:rows] = value[:rows]
+                compatible[key] = merged
+                skipped.append((key, f"adapted {tuple(value.shape)} -> {tuple(target.shape)}"))
+                continue
+            skipped.append((key, f"shape {tuple(value.shape)} != {tuple(target.shape)}"))
+
+        incompatible = self.load_state_dict(compatible, strict=False)
+        return incompatible, skipped
 
     def forward(
         self,

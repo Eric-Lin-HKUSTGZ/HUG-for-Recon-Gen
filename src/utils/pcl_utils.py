@@ -9,6 +9,8 @@ from typing import Optional, Union
 import numpy as np
 import torch
 
+from .camera_geometry import backproject_depth_np, backproject_pixels_np
+
 
 def backproject_to_pcl(
     depth_m: np.ndarray,
@@ -34,15 +36,9 @@ def backproject_to_pcl(
         xyz: (M, 3) float32 valid metric points.
         rgb_valid: (M, 3) uint8 colors aligned with xyz.
     """
-    H, W = depth_m.shape
-    fx, fy = K[0, 0], K[1, 1]
-    cx, cy = K[0, 2], K[1, 2]
-    u, v = np.meshgrid(np.arange(W), np.arange(H))
     z = depth_m.astype(np.float32)
     valid = (z > 0) & (z < max_depth)
-    x = (u - cx) * z / fx
-    y = (v - cy) * z / fy
-    xyz = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+    xyz = backproject_depth_np(z, K).reshape(-1, 3)
     rgb_flat = rgb.reshape(-1, 3)
     m = valid.flatten()
     if center is not None and crop_radius is not None:
@@ -66,15 +62,14 @@ def sample_fixed_n(
         n_points: target count.
         rng: optional numpy RNG (uses default if None).
     """
-    if rng is None:
-        rng = np.random.default_rng()
     M = xyz.shape[0]
     if M == 0:
         return np.zeros((n_points, 3), np.float32), np.zeros((n_points, 3), np.uint8)
+    choice = np.random.choice if rng is None else rng.choice
     if M >= n_points:
-        idx = rng.choice(M, size=n_points, replace=False)
+        idx = choice(M, size=n_points, replace=False)
     else:
-        idx = rng.choice(M, size=n_points, replace=True)
+        idx = choice(M, size=n_points, replace=True)
     return xyz[idx], rgb[idx]
 
 
@@ -85,11 +80,8 @@ def pixel_to_xyz(
     K: np.ndarray,
 ) -> np.ndarray:
     """Backproject a single pixel (u, v) at depth d (meters) through K → (x, y, z)."""
-    fx, fy = K[0, 0], K[1, 1]
-    cx, cy = K[0, 2], K[1, 2]
-    return np.array(
-        [(u - cx) * depth / fx, (v - cy) * depth / fy, depth], dtype=np.float32
-    )
+    point_uvd = np.array([u, v, depth], dtype=np.float32)
+    return backproject_pixels_np(point_uvd, K)
 
 
 def depth_to_pcl_tensors(
@@ -100,6 +92,7 @@ def depth_to_pcl_tensors(
     max_depth: float = 3.0,
     center: Optional[np.ndarray] = None,
     crop_radius: Optional[float] = None,
+    rng: Optional[np.random.Generator] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """End-to-end: depth + rgb + K → fixed-size (xyz, rgb) tensors.
 
@@ -126,7 +119,7 @@ def depth_to_pcl_tensors(
         center=center,
         crop_radius=crop_radius,
     )
-    xyz_np, rgb_np = sample_fixed_n(xyz_np, rgb_np, n_points)
+    xyz_np, rgb_np = sample_fixed_n(xyz_np, rgb_np, n_points, rng=rng)
     xyz = torch.from_numpy(xyz_np).float()
     rgb_pcl = torch.from_numpy(rgb_np).float() / 255.0
     return xyz, rgb_pcl

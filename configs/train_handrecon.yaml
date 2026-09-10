@@ -1,0 +1,165 @@
+# HUG 手部重建训练配置（DexYCB-only）
+# 用法: torchrun --nproc_per_node=4 -m src.train --config configs/train_handrecon.yaml
+# 数据: scripts/convert_ho3d.py / convert_dexycb.py 转换产物
+# 划分: scripts/make_handrecon_splits.py 生成（DexYCB 官方 s0，HO3D 按序列留出）
+# norm_stats: scripts/compute_norm_stats.py（仅训练集，无 test 泄漏）
+
+trainer:
+  model:
+    # ---- 模态开关（与论文 full model 一致）----
+    use_rgb: true
+    use_depth: true
+    use_2d_point: false
+    use_pointpainting: true
+    # ---- RGB 编码器（冻结 DINOv2）----
+    encoder_name: facebook/dinov2-with-registers-base
+    # ---- 点云编码器（可训练 PointNeXt）----
+    pcl_width: 64
+    pcl_sa_radii: [0.025, 0.05, 0.10, 0.20]
+    pcl_blocks: [1, 2, 1, 1]
+    pcl_use_rgb: true
+    # ---- 融合 ----
+    d_fusion: 1024
+    n_patches: 256
+    fusion_layers: 4
+    fusion_heads: 8
+    patch_grid_size: 16
+    image_size: 224
+    fourier_scale: 1.0
+    # Restore the fusion direction used by the released HUG checkpoint/code.
+    query_fusion_mode: legacy_broadcast
+    dropout: 0.1
+    # ---- flow transformer (DiT) ----
+    d_mano: 109
+    d_model: 512
+    flow_layers: 6
+    flow_heads: 8
+    sampling_steps: 50
+    # ---- 0.2m足以让 4096 点密集覆盖手部 ----
+    pcl_crop_radius: 0.2
+
+  data:
+    datasets:
+      # - path: /root/code/vepfs/dataset/hand_recon_hug/ho3d
+      #   train_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_train.clean.txt
+      #   val_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_val.clean.txt
+      - path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v2_canonical_right
+        train_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_train.clean.txt
+        val_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_test.clean.txt
+    # Query depth is physically bounded and filtered to the dominant local
+    # depth cluster before it is used as the 20 cm PCL crop center.
+    query_min_depth: 0.15
+    query_max_depth: 2.0
+    query_depth_cluster_width: 0.12
+    # Metric sensor/PCL augmentation; val/test remain clean and deterministic.
+    augmentation:
+      enabled: false
+      # DINOv2 is frozen and train/val are same-domain; keep RGB clean while
+      # measuring the geometry changes below.
+      color_scale: 0.0
+      brightness_delta: 0.0
+      brightness_prob: 0.0
+      contrast_min: 1.0
+      contrast_max: 1.0
+      contrast_prob: 0.0
+      depth:
+        enabled: false
+        probability: 0.50
+        gaussian_std: [0.001, 0.003]
+        pixel_dropout_prob: [0.0, 0.03]
+        frame_bias_probability: 0.30
+        frame_bias_max: 0.005
+        region_dropout_probability: 0.20
+        region_size: [5, 20]
+        outlier_probability: [0.0, 0.005]
+        outlier_delta: 0.020
+      pointcloud:
+        enabled: false
+        probability: 0.50
+        jitter_std: [0.0, 0.001]
+        dropout_ratio: [0.0, 0.10]
+        region_dropout_probability: 0.20
+        region_radius: [0.01, 0.04]
+      affine:
+        enabled: false
+    norm_stats_file: /root/code/HUG-for-Recon-Gen/assets/norm_stats_dexycb_109d.json
+    n_points_input: 4096
+    max_val_samples: 4096          # 从 DexYCB val 等距采样 4096 条，控制单次评估耗时
+    num_workers: 16
+    prefetch_factor: 4
+
+  train:
+    total_steps: 25000             
+    batch_size: 256                # 每张卡 batch
+    lr: 1.0e-4
+    weight_decay: 0.0
+    betas: [0.9, 0.999]
+    warmup_steps: 2500             # total_steps 的 10%
+    lr_min_ratio: 0.0              # warmup 后 cosine 衰减到 lr * lr_min_ratio（0 = 衰减到 0）
+    grad_clip: 1.0
+    # ---- 当前参与反向传播的三个损失 ----
+    # Flow velocity loss：完整 109D 归一化速度的 MSE，包含 t/R/theta/shape。
+    lambda_v: 1.0
+    # 3D joint loss：x0_hat 经 MANO 解码后的 21 个相机系关节坐标 L1，乘 (1-t)。
+    lambda_3d: 20.0
+    # 3D mesh loss：x0_hat 经 MANO 解码后的 778 个相机系顶点坐标 L1，乘 (1-t)。
+    # 顶点和关节都按坐标求 mean，10.0 使 mesh 权重为 joint 的一半。
+    lambda_mesh_3d: 10.0
+
+    # ---- 历史扩展损失：全部关闭，仅保留键名便于旧实验配置对照 ----
+    # 旧 PA joint loss：去全局姿态并做中心/尺度对齐后的关节 SmoothL1；当前不计算。
+    lambda_joint_local: 0.0
+    # 旧 PA vertex loss：去全局姿态并做中心/尺度对齐后的顶点 SmoothL1；当前不计算。
+    lambda_vertex_local: 0.0
+    # 旧 theta loss：15 个 MANO 手指关节旋转的 SO(3) 角度约束；当前不计算。
+    lambda_theta: 0.0
+    # 旧 bone direction loss：20 根手骨方向的余弦距离；当前不计算。
+    lambda_bone_direction: 0.0
+    # 旧 bone ratio loss：归一化骨长比例的 SmoothL1；当前不计算。
+    lambda_bone_ratio: 0.0
+    # 旧 shape x0 loss：预测和 GT 的 10D MANO beta 直接 SmoothL1；当前不计算。
+    lambda_shape_x0: 0.0
+    # 旧 2D loss：MANO 关节投影与 2D GT 的归一化像素 L1；当前不计算。
+    lambda_2d: 0.0
+    # 旧 translation loss：预测和 GT 腕部平移的 SmoothL1；当前不计算。
+    lambda_translation: 0.0
+    # 旧 rotation loss：预测和 GT 全局腕部旋转的 SO(3) 测地角；当前不计算。
+    lambda_rotation: 0.0
+    ema_start_step: 12500          # total_steps 的 50%（论文 50K/100K 同比例）
+    ema_decay: 0.999
+    bf16: true
+    seed: 42
+    log_every: 20
+    heartbeat_every: 20              # 长时间 batch/val/checkpoint 前的存活事件间隔
+    val_every: 1000
+    ckpt_every: 1000          # 与 val_every 对齐，续训点即评估点
+    output_dir: /root/code/vepfs/HUG-for-Recon-Gen/hand_recon/20260910_v22_hug_loss_mesh_no_augmentation
+    log_file: /root/code/vepfs/HUG-for-Recon-Gen/logs/hand_recon/20260910_v22_hug_loss_mesh_no_augmentation.jsonl
+    tensorboard:
+      enabled: true
+      log_dir: tensorboard          # relative paths are created under output_dir
+      flush_secs: 10
+      max_queue: 10
+    pretrained: /root/code/vepfs/HUG-for-Recon-Gen/hug_checkpoint/hug_full.safetensors  # 仅迁移权重；保留本配置的 DexYCB norm stats
+    resume: null                  # 想要接着训练，把路径加上即可（注意是model.pt文件）
+
+  val:                            # 按用户要求：训练中直接用官方 s0_test 评测并选择 best
+    max_samples: 4096             # 从完整 test 等距取固定 4096 条，跨 checkpoint 可比
+    datasets:
+      - name: dexycb_s0_test_selection  # 注意：test 已参与模型选择，不再是独立盲测
+        path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v2_canonical_right
+        samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_test.clean.txt
+      # - name: ho3d_eval            # HO3D 官方 evaluation split（跨主体，joints/verts GT）
+      #   path: /root/code/vepfs/dataset/hand_recon_hug/ho3d_eval
+      #   samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_eval.clean.txt
+
+  test:                            # 官方测试集全量评测：torchrun -m src.eval_test --config <本配置>
+    batch_size: 256                # 每卡 batch
+    out: null                      # 结果 json 输出路径；null 则默认 <output_dir>/test_results.json
+    datasets:
+      - name: dexycb_test          # DexYCB 官方 s0_test（MANO GT，走 sample+build_loss_dicts）
+        path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v2_canonical_right
+        samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_test.clean.txt
+      # - name: ho3d_eval            # HO3D_v3 官方 evaluation split（joints/verts GT，无 MANO，走推理路径）
+      #   path: /root/code/vepfs/dataset/hand_recon_hug/ho3d_eval
+      #   samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_eval.clean.txt

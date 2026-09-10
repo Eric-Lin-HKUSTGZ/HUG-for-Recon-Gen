@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..utils.camera_geometry import project_points_torch
 from .transformer import CrossAttentionBlock, TransformerBlock
 
 
@@ -49,7 +50,20 @@ class FourierPosEmbed(nn.Module):
 
 
 class PatchFusion(nn.Module):
-    """Fuse RGB patches (DINOv2) + PCL tokens (PointNeXt) with point conditioning."""
+    """Fuse RGB/PCL patches with query-point conditioning.
+
+    ``legacy_broadcast`` preserves the original checkpoint architecture. Its
+    scene-to-single-query cross-attention is mathematically query-independent
+    at the attention-score level because softmax is taken over one key.
+
+    ``query_to_scene`` makes the query the single Q and the scene tokens K/V,
+    so the query selects among multiple scene tokens. It also adds explicit
+    query-relative XYZ features to depth tokens before attention. The selected
+    query context is gated and broadcast back to the scene sequence, retaining
+    the sequence interface consumed by the flow transformer.
+    """
+
+    QUERY_FUSION_MODES = ("legacy_broadcast", "query_to_scene")
 
     def __init__(
         self,
@@ -67,6 +81,7 @@ class PatchFusion(nn.Module):
         image_size: int = 224,
         fourier_scale: float = 1.0,
         use_2d_point: bool = False,
+        query_fusion_mode: str = "legacy_broadcast",
     ):
         super().__init__()
         self.d_model = d_model
@@ -77,6 +92,12 @@ class PatchFusion(nn.Module):
         self.use_pointpainting = use_pointpainting
         self.image_size = image_size
         self.use_2d_point = use_2d_point
+        if query_fusion_mode not in self.QUERY_FUSION_MODES:
+            raise ValueError(
+                f"query_fusion_mode must be one of {self.QUERY_FUSION_MODES}, "
+                f"got {query_fusion_mode!r}"
+            )
+        self.query_fusion_mode = query_fusion_mode
 
         # 3D embed for depth centroids (and 3D point in default mode). When
         # use_2d_point=False, the same embed serves the point token so attention
@@ -111,7 +132,23 @@ class PatchFusion(nn.Module):
             nn.SiLU(),
             nn.Linear(d_model, d_model),
         )
-        self.point_cross_attn = CrossAttentionBlock(d_model, n_heads, dropout=dropout)
+        if query_fusion_mode == "legacy_broadcast":
+            # Kept under its original name for exact legacy checkpoint loading.
+            self.point_cross_attn = CrossAttentionBlock(
+                d_model, n_heads, dropout=dropout
+            )
+        else:
+            self.query_to_scene_attn = CrossAttentionBlock(
+                d_model, n_heads, dropout=dropout
+            )
+            # Small bounded residuals keep pretrained scene features stable at
+            # initialization while allowing both paths to grow during training.
+            self.query_context_gate = nn.Parameter(torch.tensor(0.1))
+            if not use_2d_point and use_depth:
+                self.relative_pos_embed_3d = FourierPosEmbed(
+                    d_model, in_dim=3, scale=fourier_scale
+                )
+                self.relative_gate = nn.Parameter(torch.tensor(0.1))
 
         self.transformer = nn.Sequential(
             *[
@@ -124,17 +161,8 @@ class PatchFusion(nn.Module):
         self, centroids: torch.Tensor, camera_K: torch.Tensor
     ) -> torch.Tensor:
         """(B, N, 3) metric XYZ → (B, N, 2) normalized [-1, 1] image coords."""
-        X, Y, Z = centroids.unbind(-1)
-        Z_safe = Z.clamp(min=1e-3)
-        fx = camera_K[:, 0, 0:1]
-        fy = camera_K[:, 1, 1:2]
-        cx = camera_K[:, 0, 2:3]
-        cy = camera_K[:, 1, 2:3]
-        u = fx * (X / Z_safe) + cx
-        v = fy * (Y / Z_safe) + cy
-        norm_u = 2.0 * u / self.image_size - 1.0
-        norm_v = 2.0 * v / self.image_size - 1.0
-        return torch.stack([norm_u, norm_v], dim=-1)
+        uv = project_points_torch(centroids, camera_K, eps=1e-3)
+        return 2.0 * uv / self.image_size - 1.0
 
     def _paint(
         self,
@@ -187,6 +215,18 @@ class PatchFusion(nn.Module):
             point_token = self.pos_embed_3d(point.unsqueeze(1))
         point_token = self.point_proj(point_token)
 
+        relative_depth_pos = None
+        if (
+            self.query_fusion_mode == "query_to_scene"
+            and not self.use_2d_point
+            and depth_centroids is not None
+            and hasattr(self, "relative_pos_embed_3d")
+        ):
+            relative_xyz = depth_centroids - point.unsqueeze(1)
+            relative_depth_pos = torch.tanh(
+                self.relative_gate
+            ) * self.relative_pos_embed_3d(relative_xyz)
+
         if self.use_pointpainting:
             if camera_K is None:
                 raise ValueError("camera_K required when use_pointpainting=True")
@@ -194,11 +234,15 @@ class PatchFusion(nn.Module):
             fused = torch.cat([painted, depth_patches], dim=-1)
             x = self.painting_proj(fused)
             x = x + self.pos_embed_3d(depth_centroids)
+            if relative_depth_pos is not None:
+                x = x + relative_depth_pos
         elif self.use_rgb and self.use_depth:
             x_rgb = self.patch_proj(rgb_patches) + self.rgb_pos_embed
             x_depth = self.depth_patch_proj(depth_patches) + self.pos_embed_3d(
                 depth_centroids
             )
+            if relative_depth_pos is not None:
+                x_depth = x_depth + relative_depth_pos
             x_rgb = x_rgb + self.modality_embed[0]
             x_depth = x_depth + self.modality_embed[1]
             x = torch.cat([x_rgb, x_depth], dim=1)
@@ -208,8 +252,16 @@ class PatchFusion(nn.Module):
             x = self.depth_patch_proj(depth_patches) + self.pos_embed_3d(
                 depth_centroids
             )
+            if relative_depth_pos is not None:
+                x = x + relative_depth_pos
 
-        x = self.point_cross_attn(x, context=point_token)
+        if self.query_fusion_mode == "legacy_broadcast":
+            x = self.point_cross_attn(x, context=point_token)
+        else:
+            # Q has length 1 while K/V span the scene. Unlike the legacy
+            # direction, softmax now ranks multiple spatial tokens.
+            query_context = self.query_to_scene_attn(point_token, context=x)
+            x = x + torch.tanh(self.query_context_gate) * query_context
 
         x = self.transformer(x)
         return x

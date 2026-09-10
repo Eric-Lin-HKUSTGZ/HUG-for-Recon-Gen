@@ -129,11 +129,11 @@ def load_model(
                 continue
             else:
                 model_state[k] = v
-        model.load_state_dict(model_state, strict=False)
+        model.load_compatible_state_dict(model_state)
         logger.info(f"Loaded EMA weights from {checkpoint_path}")
     else:
         kind = ckpt.get("weights_kind", "model")
-        model.load_state_dict(ckpt["model"], strict=False)
+        model.load_compatible_state_dict(ckpt["model"])
         logger.info(f"Loaded {kind} weights from {checkpoint_path}")
 
     model.eval()
@@ -191,12 +191,14 @@ def main(
 
     use_depth = getattr(model, "use_depth", False)
     use_rgb = getattr(model, "use_rgb", True)
+    pcl_use_rgb = getattr(model, "pcl_use_rgb", False)
     dataset = GraspDataset(
         str(dataset_path),
         split="val",
         indices=indices,
         use_rgb=use_rgb,
         use_depth=use_depth,
+        d_mano=int(getattr(model.flow, "d_mano", 99)),
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
@@ -207,7 +209,7 @@ def main(
     sample_idx = 0
     total_sample_time = 0.0
     total_timed = 0
-    betas = model.fixed_betas.squeeze(0)
+
     perf_rows: list[tuple[int, int, float, float]] = []
     live = Live(_perf_table(perf_rows), console=console, refresh_per_second=4)
     live.start()
@@ -217,6 +219,7 @@ def main(
         stems = batch["stem"]
         rgb = batch["rgb"].to(device) if use_rgb else None
         pcl_xyz = batch["pcl_xyz"].to(device) if use_depth else None
+        pcl_rgb = batch["pcl_rgb"].to(device) if (use_depth and pcl_use_rgb) else None
 
         if device == "cuda":
             torch.cuda.synchronize()
@@ -228,6 +231,7 @@ def main(
                 steps=sampling_steps,
                 rgb=rgb,
                 pcl_xyz=pcl_xyz,
+                pcl_rgb=pcl_rgb,
             )
         if device == "cuda":
             torch.cuda.synchronize()
@@ -255,7 +259,7 @@ def main(
 
             grasp_dict = mano_params_to_grasp_dict(
                 samples[i],
-                betas,
+                model.get_betas(samples[i]),
                 model.mano,
                 camera.K,
                 model.mesh_faces,

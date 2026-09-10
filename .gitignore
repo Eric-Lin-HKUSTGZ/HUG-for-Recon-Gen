@@ -260,3 +260,6 @@ condaenv.*.requirements.txt
 # Predictions
 grasp_pred/
 samples.txt
+
+# assets
+assets/*

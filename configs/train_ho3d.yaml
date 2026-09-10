@@ -1,0 +1,85 @@
+# HUG 手部重建训练配置（HO3D_v3 单数据集版，验证转换 bug 修复效果）
+# 用法: torchrun --nproc_per_node=4 -m src.train --config configs/train_ho3d.yaml
+# 数据: scripts/convert_ho3d.py 修复后重转换产物
+# 注意: 使用 HO3D 专属 norm_stats（assets/norm_stats_ho3d.json），与混合版互斥
+
+trainer:
+  model:
+    # ---- 模态开关（与论文 full model 一致）----
+    use_rgb: true
+    use_depth: true
+    use_2d_point: false
+    use_pointpainting: true
+    # ---- RGB 编码器（冻结 DINOv2）----
+    encoder_name: facebook/dinov2-with-registers-base
+    # ---- 点云编码器（可训练 PointNeXt）----
+    pcl_width: 64
+    pcl_sa_radii: [0.025, 0.05, 0.10, 0.20]
+    pcl_blocks: [1, 2, 1, 1]
+    pcl_use_rgb: true
+    # ---- 融合 ----
+    d_fusion: 1024
+    n_patches: 256
+    fusion_layers: 4
+    fusion_heads: 8
+    patch_grid_size: 16
+    image_size: 224
+    fourier_scale: 1.0
+    dropout: 0.1
+    # ---- flow transformer (DiT) ----
+    d_mano: 99
+    d_model: 512
+    flow_layers: 6
+    flow_heads: 8
+    sampling_steps: 50
+    # ---- 手比物体小：0.3m → 0.2m，让 4096 点密集覆盖手部 ----
+    pcl_crop_radius: 0.2
+
+  data:
+    datasets:
+      - path: /root/code/vepfs/dataset/hand_recon_hug/ho3d
+        train_samples: /root/code/vepfs/dataset/hand_recon_hug/splits/ho3d_train.clean.txt
+        val_samples: /root/code/vepfs/dataset/hand_recon_hug/splits/ho3d_val.clean.txt
+    norm_stats_file: /root/code/HUG-for-Recon-Gen/assets/norm_stats_ho3d.json
+    n_points_input: 4096
+    num_workers: 16
+    prefetch_factor: 4
+
+  train:
+    total_steps: 25000             # 预训练权重 finetune；HO3D 单数据集 77k 帧，25k 步 ≈ 260 epoch，val 曲线可观察过拟合，需要可降到 12k
+    batch_size: 200                # 每张卡 batch
+    lr: 1.0e-4
+    weight_decay: 0.0
+    betas: [0.9, 0.999]
+    warmup_steps: 2500
+    lr_min_ratio: 0.0              # warmup 后 cosine 衰减到 lr * lr_min_ratio
+    grad_clip: 1.0
+    lambda_v: 1.0
+    lambda_3d: 20.0
+    lambda_2d: 1.0                 # 2D 重投影损失权重
+    ema_start_step: 12500
+    ema_decay: 0.999
+    bf16: true
+    seed: 42
+    log_every: 20
+    val_every: 1000
+    ckpt_every: 1000
+    output_dir: /root/code/vepfs/HUG-for-Recon-Gen/hand_recon/20260830_v3_ho3d
+    log_file: /root/code/vepfs/HUG-for-Recon-Gen/logs/hand_recon/20260830_v3_ho3d.jsonl
+    pretrained: /root/code/vepfs/HUG-for-Recon-Gen/hug_checkpoint/hug_full.safetensors
+    resume: null
+
+  val:                            # 训练中验证/选型集（真实采样指标，无 loss）
+    max_samples: 4096
+    datasets:
+      - name: ho3d_eval            # HO3D 官方 evaluation split（跨主体，joints/verts GT）
+        path: /root/code/vepfs/dataset/hand_recon_hug/ho3d_eval
+        samples: /root/code/vepfs/dataset/hand_recon_hug/splits/ho3d_eval.clean.txt
+
+  test:                            # 官方测试集全量评测：torchrun -m src.eval_test --config <本配置>
+    batch_size: 256
+    out: null                      # 默认 <output_dir>/test_results.json
+    datasets:
+      - name: ho3d_eval
+        path: /root/code/vepfs/dataset/hand_recon_hug/ho3d_eval
+        samples: /root/code/vepfs/dataset/hand_recon_hug/splits/ho3d_eval.clean.txt

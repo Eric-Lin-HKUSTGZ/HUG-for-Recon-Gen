@@ -17,7 +17,7 @@ import viser
 from rich.console import Console
 
 from .utils.data_keys import MANO_RIGHT_MESH_FACES_FILE
-from .utils.pcl_utils import backproject_to_pcl
+from .utils.pcl_utils import backproject_to_pcl, pixel_to_xyz
 from .utils.viser_utils import (
     add_hand_keypoints,
     add_hand_skeleton,
@@ -324,10 +324,7 @@ def visualize(
                 z_mm = int(depth_image[v_224, u_224])
                 if z_mm > 0:
                     z = z_mm / 1000.0
-                    fx, fy = K_small[0, 0], K_small[1, 1]
-                    cx, cy = K_small[0, 2], K_small[1, 2]
-                    x = (u_224 - cx) * z / fx
-                    y = (v_224 - cy) * z / fy
+                    x, y, _ = pixel_to_xyz(u_224, v_224, z, K_small)
                     point_handle = server.scene.add_icosphere(
                         "/pred/point_condition",
                         radius=0.01,

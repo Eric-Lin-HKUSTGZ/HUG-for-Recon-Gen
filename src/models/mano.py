@@ -35,7 +35,14 @@ class MANO(nn.Module):
         self.mano_layer = ManoLayer(
             rot_mode="axisang",
             side=side,
-            center_idx=0,  # Wrist at origin
+            # Wrist-recentered joints: our 99D t IS the wrist position in the
+            # camera frame (conversion stores t = MANO_translation + J0_template,
+            # verified against official joint_3d to ~5mm; see
+            # scripts/conversion_common.py). The MANO template wrist sits at
+            # J0=[0.0957, 0.0064, 0.0062] from the template origin, so keeping
+            # the wrist at the origin here and adding our t lands the hand at
+            # the true wrist position.
+            center_idx=0,
             mano_assets_root=MANO_MODELS_FOLDER,
             use_pca=use_pca,
             flat_hand_mean=flat_hand_mean,
@@ -46,10 +53,11 @@ class MANO(nn.Module):
             param.requires_grad = False
 
     def decode_mano_params(self, mano_params: torch.Tensor):
-        """Decode 99D MANO pose to components.
+        """Decode the pose portion of a 99D or 109D MANO state.
 
         Args:
-            mano_params: (B, 99) = t(3) + R_6d(6) + pose_6d(90), translation in meters.
+            mano_params: (B, 99) = t(3) + R_6d(6) + pose_6d(90), or
+                (B, 109) with ten trailing MANO shape coefficients.
 
         Returns:
             t: (B, 3) metric wrist translation in camera frame.
@@ -58,7 +66,10 @@ class MANO(nn.Module):
         """
         t = mano_params[:, :3]
         R_6d = mano_params[:, 3:9]
-        pose_6d = mano_params[:, 9:].reshape(-1, 15, 6)
+        # Shape coefficients, when present, are deliberately ignored here;
+        # MANO.forward passes them as ``betas``. Slicing the legacy 99D pose
+        # keeps this decoder compatible with the new 109D state.
+        pose_6d = mano_params[:, 9:99].reshape(-1, 15, 6)
         return t, R_6d, pose_6d
 
     def forward(
@@ -66,10 +77,11 @@ class MANO(nn.Module):
         mano_params: torch.Tensor,
         betas: torch.Tensor = None,
     ):
-        """Run MANO forward pass.
+        """Run MANO forward pass for a 99D or 109D state.
 
         Args:
-            mano_params: (B, 99) = t(3) + R_6d(6) + pose_6d(90), translation in meters.
+            mano_params: (B, 99) or (B, 109) = pose state in meters. A 109D
+                state stores ten shape coefficients in the final ten entries.
             betas: (B, 10) shape parameters (optional, defaults to zeros).
 
         Returns:
@@ -88,7 +100,10 @@ class MANO(nn.Module):
         pose_coeffs = torch.cat([R_aa, pose_aa], dim=-1)
 
         if betas is None:
-            betas = torch.zeros(B, 10, device=device)
+            if mano_params.shape[-1] >= 109:
+                betas = mano_params[:, 99:109]
+            else:
+                betas = torch.zeros(B, 10, device=device)
 
         mano_output = self.mano_layer(pose_coeffs, betas)
 

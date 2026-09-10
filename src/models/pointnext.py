@@ -11,7 +11,9 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch_cluster
+
+# torch_cluster is replaced with pure-PyTorch implementations below to avoid
+# binary incompatibility on systems with glibc < 2.32.
 
 
 def _shared_mlp(dims: list[int]) -> nn.Sequential:
@@ -25,40 +27,33 @@ def _shared_mlp(dims: list[int]) -> nn.Sequential:
 
 
 def _fps_indices(xyz: torch.Tensor, k: int) -> torch.Tensor:
-    """Batched FPS: (B, N, 3) → (B, K) local indices."""
+    """Batched FPS: (B, N, 3) → (B, K) local indices (pure PyTorch)."""
     B, N, _ = xyz.shape
-    batch = torch.arange(B, device=xyz.device).repeat_interleave(N)
-    ratio = k / N
-    flat_idx = torch_cluster.fps(
-        xyz.reshape(-1, 3), batch=batch, ratio=ratio, random_start=True
-    )
-    assert flat_idx.numel() == B * k, (
-        f"FPS expected B*k={B * k} indices, got {flat_idx.numel()}"
-    )
-    flat_idx = flat_idx.reshape(B, k)
-    offsets = torch.arange(B, device=xyz.device).unsqueeze(1) * N
-    return flat_idx - offsets
+    device = xyz.device
+    # Random start
+    start = torch.randint(0, N, (B, 1), device=device)
+    selected = [start]
+    dist = torch.full((B, N), float("inf"), device=device)
+    for _ in range(k - 1):
+        latest = selected[-1]  # (B, 1)
+        latest_xyz = xyz.gather(1, latest.unsqueeze(-1).expand(-1, 1, 3))  # (B, 1, 3)
+        d = (xyz - latest_xyz).norm(dim=-1)  # (B, N)
+        dist = torch.min(dist, d)
+        farthest = dist.argmax(dim=-1, keepdim=True)  # (B, 1)
+        selected.append(farthest)
+    return torch.cat(selected, dim=-1)  # (B, K)
 
 
 def _knn_indices(query: torch.Tensor, ref: torch.Tensor, k: int) -> torch.Tensor:
-    """Batched kNN: (B, M, 3) query in (B, N, 3) ref → (B, M, k) local indices."""
-    B, M, _ = query.shape
+    """Batched kNN: (B, M, 3) query in (B, N, 3) ref → (B, M, k) (pure PyTorch)."""
+    B, M, C = query.shape
     N = ref.shape[1]
-    batch_q = torch.arange(B, device=query.device).repeat_interleave(M)
-    batch_r = torch.arange(B, device=query.device).repeat_interleave(N)
-    edge_index = torch_cluster.knn(
-        ref.reshape(-1, 3),
-        query.reshape(-1, 3),
-        k=k,
-        batch_x=batch_r,
-        batch_y=batch_q,
-    )
-    # edge_index: (2, B*M*k). row[0]=flat query idx, row[1]=flat ref idx.
-    # Sort by query idx so neighbors are grouped per centroid.
-    order = edge_index[0].argsort(stable=True)
-    flat_nbr = edge_index[1][order].reshape(B * M, k)
-    offsets = (torch.arange(B * M, device=query.device) // M) * N
-    return (flat_nbr - offsets.unsqueeze(1)).reshape(B, M, k)
+    # Pairwise distances: (B, M, N)
+    diff = query.unsqueeze(2) - ref.unsqueeze(1)  # (B, M, N, 3)
+    dist = diff.norm(dim=-1)  # (B, M, N)
+    # top-k smallest distances
+    _, nbr_idx = dist.topk(k, dim=-1, largest=False)  # (B, M, k)
+    return nbr_idx
 
 
 def _gather(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:

@@ -26,7 +26,13 @@ class SinusoidalPosEmb(nn.Module):
 
 
 class TokenPerGroupDiT(nn.Module):
-    """DiT denoiser with separate tokens for translation, wrist, and fingers."""
+    """DiT denoiser with separate tokens for MANO parameter groups.
+
+    The legacy 99D state contains translation, wrist rotation and finger
+    rotation. The 109D hand-reconstruction state adds a fourth token for the
+    ten MANO shape coefficients, which lets geometry supervision propagate to
+    the predicted hand shape instead of using one global fixed shape.
+    """
 
     def __init__(
         self,
@@ -36,17 +42,27 @@ class TokenPerGroupDiT(nn.Module):
         n_heads: int = 8,
         dropout: float = 0.1,
         norm_stats: dict = None,
+        d_mano: int = 99,
     ):
         super().__init__()
         self.d_model = d_model
+        self.d_mano = int(d_mano)
+        if self.d_mano not in (99, 109):
+            raise ValueError(
+                f"d_mano must be 99 (legacy) or 109 (learnable MANO shape), got {self.d_mano}"
+            )
+        self.use_shape = self.d_mano == 109
 
         # Per-group input projections
         self.proj_translation = nn.Linear(3, d_model, bias=False)
         self.proj_wrist = nn.Linear(6, d_model, bias=False)
         self.proj_fingers = nn.Linear(90, d_model, bias=False)
+        if self.use_shape:
+            self.proj_shape = nn.Linear(10, d_model, bias=False)
 
         # Learnable token-type embeddings
-        self.token_type_emb = nn.Parameter(torch.randn(3, d_model) * 0.02)
+        n_tokens = 4 if self.use_shape else 3
+        self.token_type_emb = nn.Parameter(torch.randn(n_tokens, d_model) * 0.02)
 
         # Timestep embedding
         self.time_mlp = nn.Sequential(
@@ -67,6 +83,8 @@ class TokenPerGroupDiT(nn.Module):
         self.out_translation = nn.Linear(d_model, 3, bias=False)
         self.out_wrist = nn.Linear(d_model, 6, bias=False)
         self.out_fingers = nn.Linear(d_model, 90, bias=False)
+        if self.use_shape:
+            self.out_shape = nn.Linear(d_model, 10, bias=False)
 
         # Final norm + modulation
         self.final_norm = nn.RMSNorm(d_model, elementwise_affine=False)
@@ -78,7 +96,10 @@ class TokenPerGroupDiT(nn.Module):
         # Zero-init outputs
         nn.init.zeros_(self.final_modulation[-1].weight)
         nn.init.zeros_(self.final_modulation[-1].bias)
-        for proj in [self.out_translation, self.out_wrist, self.out_fingers]:
+        output_projs = [self.out_translation, self.out_wrist, self.out_fingers]
+        if self.use_shape:
+            output_projs.append(self.out_shape)
+        for proj in output_projs:
             nn.init.zeros_(proj.weight)
 
         # Register normalization stats
@@ -86,38 +107,73 @@ class TokenPerGroupDiT(nn.Module):
             self._register_norm_stats(norm_stats)
         else:
             self.register_buffer("trans_mean", None)
+            self.register_buffer("shape_mean", None)
 
     def _register_norm_stats(self, norm_stats: dict):
+        # Zero-variance dimensions occur when a split uses one canonical MANO
+        # shape. Unit scale keeps normalization finite and preserves gradients
+        # from geometry losses to the learnable 109D shape head.
+        def safe_std(values):
+            values_t = torch.tensor(values, dtype=torch.float32)
+            return torch.where(values_t.abs() > 1e-6, values_t, torch.ones_like(values_t))
+
         self.register_buffer(
             "trans_mean", torch.tensor(norm_stats["translation"]["mean"])
         )
         self.register_buffer(
-            "trans_std", torch.tensor(norm_stats["translation"]["std"])
+            "trans_std", safe_std(norm_stats["translation"]["std"])
         )
         self.register_buffer(
             "wrist_mean", torch.tensor(norm_stats["wrist_rot"]["mean"])
         )
-        self.register_buffer("wrist_std", torch.tensor(norm_stats["wrist_rot"]["std"]))
+        self.register_buffer("wrist_std", safe_std(norm_stats["wrist_rot"]["std"]))
         self.register_buffer(
             "finger_mean", torch.tensor(norm_stats["finger_rot"]["mean"])
         )
         self.register_buffer(
-            "finger_std", torch.tensor(norm_stats["finger_rot"]["std"])
+            "finger_std", safe_std(norm_stats["finger_rot"]["std"])
         )
+        if self.use_shape:
+            if "shape" not in norm_stats:
+                raise ValueError(
+                    "109D MANO mode requires norm_stats['shape']; "
+                    "generate a 109D stats file with scripts/compute_norm_stats.py"
+                )
+            self.register_buffer("shape_mean", torch.tensor(norm_stats["shape"]["mean"]))
+            self.register_buffer("shape_std", safe_std(norm_stats["shape"]["std"]))
+        else:
+            self.register_buffer("shape_mean", None)
+            self.register_buffer("shape_std", None)
 
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize 99-dim MANO params per group."""
+        """Normalize 99D or 109D MANO params per group."""
+        if x.shape[-1] != self.d_mano:
+            raise ValueError(
+                f"expected MANO state width {self.d_mano}, got {x.shape[-1]}"
+            )
         trans = (x[:, :3] - self.trans_mean) / self.trans_std
         wrist = (x[:, 3:9] - self.wrist_mean) / self.wrist_std
         fingers = (x[:, 9:99] - self.finger_mean) / self.finger_std
-        return torch.cat([trans, wrist, fingers], dim=-1)
+        parts = [trans, wrist, fingers]
+        if self.use_shape:
+            shape = (x[:, 99:109] - self.shape_mean) / self.shape_std
+            parts.append(shape)
+        return torch.cat(parts, dim=-1)
 
     def denormalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Denormalize 99-dim MANO params per group."""
+        """Denormalize 99D or 109D MANO params per group."""
+        if x.shape[-1] != self.d_mano:
+            raise ValueError(
+                f"expected MANO state width {self.d_mano}, got {x.shape[-1]}"
+            )
         trans = x[:, :3] * self.trans_std + self.trans_mean
         wrist = x[:, 3:9] * self.wrist_std + self.wrist_mean
         fingers = x[:, 9:99] * self.finger_std + self.finger_mean
-        return torch.cat([trans, wrist, fingers], dim=-1)
+        parts = [trans, wrist, fingers]
+        if self.use_shape:
+            shape = x[:, 99:109] * self.shape_std + self.shape_mean
+            parts.append(shape)
+        return torch.cat(parts, dim=-1)
 
     def forward(
         self,
@@ -128,7 +184,7 @@ class TokenPerGroupDiT(nn.Module):
         """Predict velocity from noisy input (in normalized space).
 
         Args:
-            x: (B, 99) noisy MANO params in normalized space.
+            x: (B, 99) or (B, 109) noisy MANO params in normalized space.
             t: (B,) continuous timestep in [0, 1].
             cond: (B, N_patches, d_cond) patch sequence for cross-attention.
         """
@@ -138,9 +194,12 @@ class TokenPerGroupDiT(nn.Module):
         trans_tok = self.proj_translation(x[:, :3])
         wrist_tok = self.proj_wrist(x[:, 3:9])
         finger_tok = self.proj_fingers(x[:, 9:99])
+        tokens = [trans_tok, wrist_tok, finger_tok]
+        if self.use_shape:
+            tokens.append(self.proj_shape(x[:, 99:109]))
 
-        # Stack tokens: (B, 3, d_model)
-        h = torch.stack([trans_tok, wrist_tok, finger_tok], dim=1)
+        # Stack tokens: (B, 3/4, d_model)
+        h = torch.stack(tokens, dim=1)
         h = h + self.token_type_emb.unsqueeze(0)
 
         context = self.cond_proj(cond)  # (B, N_patches, d_model)
@@ -158,8 +217,11 @@ class TokenPerGroupDiT(nn.Module):
         out_trans = self.out_translation(h[:, 0])
         out_wrist = self.out_wrist(h[:, 1])
         out_fingers = self.out_fingers(h[:, 2])
+        outputs = [out_trans, out_wrist, out_fingers]
+        if self.use_shape:
+            outputs.append(self.out_shape(h[:, 3]))
 
-        return torch.cat([out_trans, out_wrist, out_fingers], dim=-1)
+        return torch.cat(outputs, dim=-1)
 
 
 class GraspFlowMatching(nn.Module):
@@ -194,6 +256,7 @@ class GraspFlowMatching(nn.Module):
             n_heads=n_heads,
             dropout=dropout,
             norm_stats=norm_stats,
+            d_mano=self.d_mano,
         )
 
     def recover_x0(self, output):

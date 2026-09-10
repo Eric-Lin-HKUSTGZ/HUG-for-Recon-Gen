@@ -47,7 +47,7 @@ class PointNeXtEncoder(nn.Module):
     """Trainable PointNeXt encoder.
 
     Wraps the PointNeXt U-Net to expose a consistent interface with
-    `DINOv2Encoder`. Outputs feature tokens AND metric XYZ centroids;
+    ``DINOv2Encoder``. Outputs feature tokens AND metric XYZ centroids;
     fusion uses the centroids for the 3D Fourier positional embed.
     """
 

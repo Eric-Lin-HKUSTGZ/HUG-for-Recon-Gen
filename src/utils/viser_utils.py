@@ -9,6 +9,7 @@ import numpy as np
 import viser
 import viser.transforms as tf
 
+from .camera_geometry import backproject_depth_np
 from .visualization_utils import (
     MANO_KEYPOINT_COLOR,
     MANO_SKELETON_COLOR,
@@ -283,22 +284,16 @@ def backproject_depth_to_point_cloud(
     depth_h, depth_w = depth_image.shape[:2]
     scale_x = depth_w / cam_w
     scale_y = depth_h / cam_h
-    K = camera_K.copy()
-    K[0, 0] *= scale_x
-    K[1, 1] *= scale_y
-    K[0, 2] *= scale_x
-    K[1, 2] *= scale_y
-
-    fx, fy = K[0, 0], K[1, 1]
-    cx, cy = K[0, 2], K[1, 2]
-    u, v = np.meshgrid(np.arange(depth_w), np.arange(depth_h))
+    scale = np.array(
+        [[scale_x, 0.0, 0.0], [0.0, scale_y, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.asarray(camera_K).dtype,
+    )
+    K = scale @ np.asarray(camera_K)
     z = depth_image.astype(np.float32) / 1000.0
     valid = (z > 0) & (z < max_depth)
     if mask is not None:
         valid = valid & (mask > 0)
-    x = (u - cx) * z / fx
-    y = (v - cy) * z / fy
-    points = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+    points = backproject_depth_np(z, K).reshape(-1, 3)
     colors = rgb_image.reshape(-1, 3)
     valid_flat = valid.flatten()
     if valid_flat.sum() == 0:

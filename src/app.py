@@ -101,6 +101,7 @@ def app(
         split="val",
         use_rgb=use_rgb,
         use_depth=use_depth,
+        d_mano=int(getattr(model.flow, "d_mano", 99)),
     )
 
     # Viser setup
@@ -321,7 +322,7 @@ def app(
             [[u_224, v_224, depth_m]], dtype=torch.float32, device=device
         )
         camera_K = torch.from_numpy(np.asarray(K_224)).float().unsqueeze(0).to(device)
-        betas = model.fixed_betas.squeeze(0)
+
         rgb = sample["rgb"].unsqueeze(0).to(device) if use_rgb else None
 
         # Build PCL. With a crop, rebuild around the live click so it matches
@@ -362,7 +363,7 @@ def app(
         K = vis["camera_K"]
         pred_grasp = mano_params_to_grasp_dict(
             preds[0],
-            betas,
+            model.get_betas(preds[0]),
             model.mano,
             K,
             model.mesh_faces,
@@ -370,10 +371,7 @@ def app(
 
         point_handle = None
         if depth_image is not None and depth_m > 0:
-            fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-            pt3d = np.array(
-                [(u_224 - cx) * depth_m / fx, (v_224 - cy) * depth_m / fy, depth_m]
-            )
+            pt3d = pixel_to_xyz(u_224, v_224, depth_m, np.asarray(K))
             point_handle = server.scene.add_icosphere(
                 f"/predictions/click_{int(time.time_ns())}",
                 radius=0.01,
@@ -390,7 +388,7 @@ def app(
             n_frames = min(120, max(2, int(gui_anim_duration.value * 60)))
             frames = mano_params_to_animation(
                 preds[0],
-                betas,
+                model.get_betas(preds[0]),
                 model.mano,
                 n_frames=n_frames,
                 pre_offset_m=(off, off),
@@ -459,7 +457,8 @@ def app(
                 vis["depth_point_cloud"] = dpc
 
         # Camera frustum and frame
-        fov = 2 * np.arctan2(height / 2, K[1, 1])
+        fy_eff = np.linalg.norm(np.asarray(K)[1, :2])
+        fov = 2 * np.arctan2(height / 2, max(fy_eff, 1e-6))
         aspect = width / height
         frustum = server.scene.add_camera_frustum(
             "/scene/rgb_frustum",

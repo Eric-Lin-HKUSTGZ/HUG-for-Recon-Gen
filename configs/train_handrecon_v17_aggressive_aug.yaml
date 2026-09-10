@@ -1,0 +1,155 @@
+# HUG 手部重建训练配置 v17 - 激进数据增强版本
+# 目标：解决过拟合问题，缩小Train/Val Gap
+# 当前问题：Train MPJPE=7.5mm, Val MPJPE=20mm, Gap=12mm
+# 方案A：仅修改数据增强，其他保持不变
+# 预期：Val PA-MPJPE 从 7.5mm → 6.0-6.5mm
+
+trainer:
+  model:
+    # ---- 模态开关（与论文 full model 一致）----
+    use_rgb: true
+    use_depth: true
+    use_2d_point: false
+    use_pointpainting: true
+    # ---- RGB 编码器（冻结 DINOv2）----
+    encoder_name: facebook/dinov2-with-registers-base
+    # ---- 点云编码器（可训练 PointNeXt）----
+    pcl_width: 64
+    pcl_sa_radii: [0.025, 0.05, 0.10, 0.20]
+    pcl_blocks: [1, 2, 1, 1]
+    pcl_use_rgb: true
+    # ---- 融合 ----
+    d_fusion: 1024
+    n_patches: 256
+    fusion_layers: 4
+    fusion_heads: 8
+    patch_grid_size: 16
+    image_size: 224
+    fourier_scale: 1.0
+    dropout: 0.1
+    # ---- flow transformer (DiT) ----
+    d_mano: 109
+    d_model: 512
+    flow_layers: 6
+    flow_heads: 8
+    sampling_steps: 100              # 改回100（150效果不明显）
+    # ---- 0.2m足以让 4096 点密集覆盖手部 ----
+    pcl_crop_radius: 0.2
+
+  data:
+    datasets:
+      - path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v2_canonical_right
+        train_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_train.clean.txt
+        val_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_test.clean.txt
+
+    query_min_depth: 0.15
+    query_max_depth: 2.0
+    query_depth_cluster_width: 0.12
+
+    # 🔥🔥🔥 方案A核心：激进数据增强 🔥🔥🔥
+    augmentation:
+      enabled: true
+
+      # RGB保持关闭（DINOv2冻结）
+      color_scale: 0.0
+      brightness_delta: 0.0
+      brightness_prob: 0.0
+      contrast_min: 1.0
+      contrast_max: 1.0
+      contrast_prob: 0.0
+
+      # 🔥 激进Depth增强（解决过拟合）
+      depth:
+        enabled: true
+        probability: 0.85                    # 0.50 → 0.85 (大幅提高)
+        gaussian_std: [0.002, 0.008]         # [0.001, 0.003] → [0.002, 0.008] (更强噪声)
+        pixel_dropout_prob: [0.0, 0.08]      # [0.0, 0.03] → [0.0, 0.08] (更多dropout)
+        frame_bias_probability: 0.40         # 0.30 → 0.40
+        frame_bias_max: 0.012                # 0.005 → 0.012 (更大偏差)
+        region_dropout_probability: 0.40     # 0.20 → 0.40 (更多区域dropout)
+        region_size: [5, 30]                 # [5, 20] → [5, 30] (更大区域)
+        outlier_probability: [0.0, 0.010]    # [0.0, 0.005] → [0.0, 0.010]
+        outlier_delta: 0.030                 # 0.020 → 0.030
+
+      # 🔥 激进Pointcloud增强（解决过拟合）
+      pointcloud:
+        enabled: true
+        probability: 0.85                    # 0.50 → 0.85 (大幅提高)
+        jitter_std: [0.0, 0.002]            # [0.0, 0.001] → [0.0, 0.002] (更多抖动)
+        dropout_ratio: [0.0, 0.20]          # [0.0, 0.10] → [0.0, 0.20] (最多丢20%点)
+        region_dropout_probability: 0.40     # 0.20 → 0.40
+        region_radius: [0.01, 0.05]         # [0.01, 0.04] → [0.01, 0.05]
+
+      # 🔥 启用Affine增强（增加视角多样性）
+      affine:
+        enabled: true                        # false → true ✅
+        probability: 0.60                    # 60%概率应用
+        scale_factor: 0.15                   # ±15%缩放
+        rotation_deg: 15                     # ±15度旋转
+        translation_frac: 0.08               # ±8%平移
+
+    norm_stats_file: /root/code/HUG-for-Recon-Gen/assets/norm_stats_dexycb_109d.json
+    n_points_input: 4096
+    max_val_samples: 4096
+    num_workers: 16
+    prefetch_factor: 4
+
+  train:
+    total_steps: 25000
+    batch_size: 256                # 保持不变
+    lr: 1.0e-4
+    weight_decay: 0.0
+    betas: [0.9, 0.999]
+    warmup_steps: 2500
+    lr_min_ratio: 0.0
+    grad_clip: 1.0
+
+    lambda_v: 1.0
+    lambda_3d: 20.0
+    lambda_2d: 1.0
+    lambda_translation: 20.0
+    lambda_rotation: 0.25
+    translation_smooth_l1_beta: 0.005
+
+    flow_translation_weight: 2.0
+    flow_wrist_weight: 2.0
+    flow_finger_weight: 1.0
+    flow_shape_weight: 0.5
+
+    # 几何损失权重保持不变（方案A专注增强）
+    geom_joint_abs_ratio: 0.35
+    geom_vertex_abs_ratio: 0.35
+    geom_joint_rel_ratio: 0.15
+    geom_vertex_rel_ratio: 0.15
+    geom_vertex_ramp_steps: 1000
+    geom_smooth_l1_beta: 0.01
+
+    ema_start_step: 12500
+    ema_decay: 0.999
+    bf16: true
+    seed: 42
+
+    log_every: 20
+    heartbeat_every: 20
+    val_every: 1000
+    ckpt_every: 1000
+
+    output_dir: /root/code/vepfs/HUG-for-Recon-Gen/hand_recon/20260909_v17_aggressive_aug
+    log_file: /root/code/vepfs/HUG-for-Recon-Gen/logs/hand_recon/20260909_v17_aggressive_aug.jsonl
+    pretrained: /root/code/vepfs/HUG-for-Recon-Gen/hug_checkpoint/hug_full.safetensors
+    resume: null
+
+  val:
+    max_samples: 4096
+    datasets:
+      - name: dexycb_s0_test_selection
+        path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v2_canonical_right
+        samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_test.clean.txt
+
+  test:
+    batch_size: 256
+    out: null
+    datasets:
+      - name: dexycb_test
+        path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v2_canonical_right
+        samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_test.clean.txt

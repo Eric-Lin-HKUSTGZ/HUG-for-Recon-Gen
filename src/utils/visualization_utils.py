@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 import torch
 from rich import box
 from rich.table import Table
+from .camera_geometry import backproject_depth_np, backproject_pixels_np
 
 from ..models.mano import project_3d_to_2d
 
@@ -265,17 +266,10 @@ def _backproject_depth(
 
     Caller must pass a camera_K whose resolution matches depth_image.
     """
-    h, w = depth_image.shape[:2]
-    fx, fy = camera_K[0, 0], camera_K[1, 1]
-    cx, cy = camera_K[0, 2], camera_K[1, 2]
-
     z = depth_image.astype(np.float32) / 1000.0
     valid = (z > 0) & (z < max_depth)
 
-    u, v = np.meshgrid(np.arange(w), np.arange(h))
-    x = (u - cx) * z / fx
-    y = (v - cy) * z / fy
-    points = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+    points = backproject_depth_np(z, camera_K).reshape(-1, 3)
     colors = depth_rgb.reshape(-1, 3)
     valid_flat = valid.flatten()
 
@@ -384,13 +378,14 @@ def create_3d_plotly(
     # point_uv, camera_K, and depth_image are all in the same (224) frame.
     if point_uv is not None and camera_K is not None and depth_image is not None:
         K = camera_K.cpu().numpy() if isinstance(camera_K, torch.Tensor) else camera_K
-        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
         dh, dw = depth_image.shape[:2]
         du = int(np.clip(round(float(point_uv[0])), 0, dw - 1))
         dv = int(np.clip(round(float(point_uv[1])), 0, dh - 1))
         d_m = float(depth_image[dv, du]) / 1000.0
-        x = (du - cx) * d_m / fx
-        y = (dv - cy) * d_m / fy
+        click_xyz = backproject_pixels_np(
+            np.array([du, dv, d_m], dtype=np.float32), K
+        )
+        x, y = float(click_xyz[0]), float(click_xyz[1])
         traces.append(
             go.Scatter3d(
                 x=[x],

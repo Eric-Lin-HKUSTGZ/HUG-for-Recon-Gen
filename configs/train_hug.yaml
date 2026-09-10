@@ -1,0 +1,68 @@
+# HUG 训练配置
+# 用法: torchrun --nproc_per_node=N -m src.train --config configs/train_hug.yaml
+# 结构对齐 GraspFlowModel 读取的 cfg.trainer.model.*（与 checkpoint 内嵌 cfg 同构，
+# 保证 inference.py / app.py 能直接加载本训练产出的 checkpoint）。
+
+trainer:
+  model:
+    # ---- 模态开关（与论文 full model 一致）----
+    use_rgb: true
+    use_depth: true
+    use_2d_point: false
+    use_pointpainting: true
+    # ---- RGB 编码器（冻结 DINOv2）----
+    encoder_name: facebook/dinov2-with-registers-base
+    # ---- 点云编码器（可训练 PointNeXt）----
+    pcl_width: 64
+    pcl_sa_radii: [0.025, 0.05, 0.10, 0.20]
+    pcl_blocks: [1, 2, 1, 1]
+    pcl_use_rgb: true
+    # ---- 融合 ----
+    d_fusion: 1024
+    n_patches: 256
+    fusion_layers: 4
+    fusion_heads: 8
+    patch_grid_size: 16
+    image_size: 224
+    fourier_scale: 1.0
+    dropout: 0.1
+    # ---- flow transformer (DiT) ----
+    d_mano: 99
+    d_model: 512
+    flow_layers: 6
+    flow_heads: 8
+    sampling_steps: 50
+    # ---- 数据相关（也写入 ckpt 供推理 app 重建点云）----
+    pcl_crop_radius: 0.3
+
+  data:
+    dataset_path: /root/code/vepfs/dataset/1m-hugs/grasp_data  # 解压后的 train pkl 目录
+    samples_filename: null          # 子集清单文件名（相对 dataset_path），null=全量
+    n_points_input: 4096
+    # 验证集划分（官方 val 无 GT，从 train 留出）：
+    # 优先使用录制级离线划分文件（scripts/make_val_split.py 生成，
+    # 同一次抓取的帧不会跨界）；文件不存在时回退到随机帧级划分 val_count 条。
+    val_split_file: split_val.txt
+    val_count: 512                  # 仅回退路径使用
+    num_workers: 16
+    prefetch_factor: 4
+
+  train:
+    total_steps: 100000             # 论文: 100K steps
+    batch_size: 200                  # 每张卡的 batch；论文 64×2 卡 = 128
+    lr: 1.0e-4                      # 论文: AdamW 1e-4
+    weight_decay: 0.0
+    betas: [0.9, 0.999]
+    warmup_steps: 5000              # 论文: 5K linear warmup
+    grad_clip: 1.0
+    lambda_v: 1.0                   # 论文 Eq.1: λv = 1
+    lambda_3d: 20.0                 # 论文 Eq.1: λ3D = 20
+    ema_start_step: 50000           # 论文: EMA from step 50K
+    ema_decay: 0.999
+    bf16: true
+    seed: 42
+    log_every: 20
+    val_every: 2000
+    ckpt_every: 5000
+    output_dir: /root/code/vepfs/HUG-for-Recon-Gen/train_output
+    resume: null                    # checkpoint 路径，非空则续训
