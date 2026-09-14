@@ -263,3 +263,7 @@ samples.txt
 
 # assets
 assets/*
+
+# docs
+strategy_docs/
+analysis_docs/

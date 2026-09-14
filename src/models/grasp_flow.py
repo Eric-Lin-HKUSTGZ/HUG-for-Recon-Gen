@@ -4,8 +4,10 @@ import math
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from .transformer import AdaLNCrossAttnBlock
+from .joint_attention import AdaLNJointAttnBlock
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -43,9 +45,15 @@ class TokenPerGroupDiT(nn.Module):
         dropout: float = 0.1,
         norm_stats: dict = None,
         d_mano: int = 99,
+        joint_layers: int = 0,
+        activation_checkpointing: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
+        if not 0 <= joint_layers <= n_layers:
+            raise ValueError("joint_layers must be between 0 and n_layers")
+        self.joint_layers = joint_layers
+        self.activation_checkpointing = bool(activation_checkpointing)
         self.d_mano = int(d_mano)
         if self.d_mano not in (99, 109):
             raise ValueError(
@@ -75,9 +83,16 @@ class TokenPerGroupDiT(nn.Module):
         # Condition projection
         self.cond_proj = nn.Linear(d_cond, d_model, bias=False)
 
-        self.blocks = nn.ModuleList(
-            [AdaLNCrossAttnBlock(d_model, n_heads, dropout) for _ in range(n_layers)]
-        )
+        # Preserve original indices 2..5 for pretrained tail blocks. Replaced
+        # blocks 0..1 have no parameters; new joint blocks use distinct keys so
+        # incompatible old attention weights cannot be silently loaded there.
+        self.blocks = nn.ModuleList([
+            nn.Identity() if i < joint_layers else AdaLNCrossAttnBlock(d_model, n_heads, dropout)
+            for i in range(n_layers)
+        ])
+        self.joint_blocks = nn.ModuleList([
+            AdaLNJointAttnBlock(d_model, n_heads, dropout) for _ in range(joint_layers)
+        ])
 
         # Per-group output projections
         self.out_translation = nn.Linear(d_model, 3, bias=False)
@@ -204,8 +219,18 @@ class TokenPerGroupDiT(nn.Module):
 
         context = self.cond_proj(cond)  # (B, N_patches, d_model)
         c = t_emb
-        for block in self.blocks:
-            h = block(h, c=c, context=context)
+        recompute = self.activation_checkpointing and self.training and torch.is_grad_enabled()
+        # context is local to this forward; start again from cond on every ODE call.
+        for block in self.joint_blocks:
+            if recompute:
+                h, context = checkpoint(block, h, c, context, use_reentrant=False, preserve_rng_state=True)
+            else:
+                h, context = block(h, c=c, context=context)
+        for block in self.blocks[self.joint_layers:]:
+            if recompute:
+                h = checkpoint(block, h, c, context, use_reentrant=False, preserve_rng_state=True)
+            else:
+                h = block(h, c=c, context=context)
 
         # Final modulation
         mod = self.final_modulation(c)
@@ -242,6 +267,8 @@ class GraspFlowMatching(nn.Module):
         dropout: float = 0.1,
         norm_stats: dict = None,
         sampling_steps: int = 50,
+        joint_layers: int = 0,
+        activation_checkpointing: bool = False,
     ):
         super().__init__()
         self.d_mano = d_mano
@@ -257,6 +284,8 @@ class GraspFlowMatching(nn.Module):
             dropout=dropout,
             norm_stats=norm_stats,
             d_mano=self.d_mano,
+            joint_layers=joint_layers,
+            activation_checkpointing=activation_checkpointing,
         )
 
     def recover_x0(self, output):

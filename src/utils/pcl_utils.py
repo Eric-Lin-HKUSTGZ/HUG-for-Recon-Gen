@@ -103,7 +103,8 @@ def depth_to_pcl_tensors(
     Args:
         center: optional (3,) crop center in camera frame (meters).
         crop_radius: optional sphere radius (meters) for object-centric
-            crop. Bit-identical to current behavior when either is None.
+            crop. With no active sphere, sample valid pixels before backprojection;
+            with a sphere, filter metric points before sampling as before.
     """
     if isinstance(depth_m, torch.Tensor):
         depth_m = depth_m.cpu().numpy()
@@ -111,15 +112,31 @@ def depth_to_pcl_tensors(
         rgb = rgb.cpu().numpy()
     if isinstance(K, torch.Tensor):
         K = K.cpu().numpy()
-    xyz_np, rgb_np = backproject_to_pcl(
-        depth_m,
-        rgb,
-        K,
-        max_depth=max_depth,
-        center=center,
-        crop_radius=crop_radius,
-    )
-    xyz_np, rgb_np = sample_fixed_n(xyz_np, rgb_np, n_points, rng=rng)
+    if center is not None and crop_radius is not None:
+        # Metric sphere membership must be determined before sampling.
+        # Keep this legacy fallback unchanged, including its strict boundary.
+        xyz_np, rgb_np = backproject_to_pcl(
+            depth_m, rgb, K, max_depth=max_depth,
+            center=center, crop_radius=crop_radius,
+        )
+        xyz_np, rgb_np = sample_fixed_n(xyz_np, rgb_np, n_points, rng=rng)
+    else:
+        # The keypoint ROI is already encoded as zero depth outside the circle.
+        # Keep the same row-major candidate order and RNG call as sample_fixed_n,
+        # but backproject only sampled pixels instead of the entire depth image.
+        z = np.asarray(depth_m, dtype=np.float32)
+        valid_idx = np.flatnonzero((z > 0) & (z < max_depth))
+        count = valid_idx.size
+        if count == 0:
+            xyz_np = np.zeros((n_points, 3), dtype=np.float32)
+            rgb_np = np.zeros((n_points, 3), dtype=np.uint8)
+        else:
+            choice = np.random.choice if rng is None else rng.choice
+            selected = valid_idx[choice(count, size=n_points, replace=count < n_points)]
+            v, u = np.divmod(selected, z.shape[1])
+            uvd = np.stack([u, v, z.reshape(-1)[selected]], axis=-1).astype(np.float32)
+            xyz_np = backproject_pixels_np(uvd, K)
+            rgb_np = rgb.reshape(-1, 3)[selected]
     xyz = torch.from_numpy(xyz_np).float()
     rgb_pcl = torch.from_numpy(rgb_np).float() / 255.0
     return xyz, rgb_pcl

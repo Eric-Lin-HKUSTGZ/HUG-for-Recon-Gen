@@ -32,6 +32,9 @@ class GraspFlowModel(nn.Module):
         self.use_rgb = model_cfg.get("use_rgb", True)
         self.use_depth = model_cfg.get("use_depth", True)
         self.use_2d_point = model_cfg.get("use_2d_point", False)
+        self.use_skeleton_condition = bool(
+            model_cfg.get("use_skeleton_condition", False)
+        )
         use_pointpainting = model_cfg.get("use_pointpainting", True)
         if not self.use_rgb and not self.use_depth:
             raise ValueError("At least one of use_rgb or use_depth must be true")
@@ -100,6 +103,9 @@ class GraspFlowModel(nn.Module):
             query_fusion_mode=model_cfg.get(
                 "query_fusion_mode", "legacy_broadcast"
             ),
+            use_query_condition=model_cfg.get("use_query_condition", True),
+            use_skeleton_condition=self.use_skeleton_condition,
+            activation_checkpointing=model_cfg.get("fusion_activation_checkpointing", False),
         )
 
         d_cond = d_fusion
@@ -121,6 +127,8 @@ class GraspFlowModel(nn.Module):
             dropout=model_cfg.dropout,
             norm_stats=norm_stats,
             sampling_steps=model_cfg.get("sampling_steps", 50),
+            joint_layers=model_cfg.get("flow_joint_layers", 0),
+            activation_checkpointing=model_cfg.get("flow_activation_checkpointing", False),
         )
 
     @staticmethod
@@ -132,16 +140,22 @@ class GraspFlowModel(nn.Module):
         self,
         point_uv: torch.Tensor,
         camera_K: torch.Tensor,
+        rgb_camera_K: Optional[torch.Tensor] = None,
         rgb: Optional[torch.Tensor] = None,
         pcl_xyz: Optional[torch.Tensor] = None,
         pcl_rgb: Optional[torch.Tensor] = None,
+        hand_keypoints_2d: Optional[torch.Tensor] = None,
+        hand_keypoints_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Encode scene inputs + query point into condition.
 
         Args:
             point_uv: (B, 3) = (u, v, depth_meters) at the query pixel. When
                 use_2d_point, depth dim is ignored.
-            camera_K: (B, 3, 3) intrinsics at the same resolution as point_uv.
+            camera_K: (B, 3, 3) original-depth intrinsics matching point_uv.
+            rgb_camera_K: (B, 3, 3) intrinsics after the RGB crop. This is
+                used only to align depth centroids and skeleton pixels with
+                local DINO patches. It equals camera_K when RGB is uncropped.
 
         In 3D mode, backprojects (u, v, d) → metric xyz internally — K is used
         only for this geometric op, never as a learned input, so the model
@@ -173,7 +187,9 @@ class GraspFlowModel(nn.Module):
             rgb_patches=rgb_patches,
             depth_patches=depth_patches,
             depth_centroids=depth_centroids,
-            camera_K=camera_K,
+            camera_K=rgb_camera_K if rgb_camera_K is not None else camera_K,
+            hand_keypoints_2d=hand_keypoints_2d,
+            hand_keypoints_valid=hand_keypoints_valid,
         )
         return cond
 
@@ -278,13 +294,23 @@ class GraspFlowModel(nn.Module):
         point_uv: torch.Tensor,
         camera_K: torch.Tensor,
         gt_mano_params: torch.Tensor,
+        rgb_camera_K: Optional[torch.Tensor] = None,
         rgb: Optional[torch.Tensor] = None,
         pcl_xyz: Optional[torch.Tensor] = None,
         pcl_rgb: Optional[torch.Tensor] = None,
+        hand_keypoints_2d: Optional[torch.Tensor] = None,
+        hand_keypoints_valid: Optional[torch.Tensor] = None,
     ):
         """Training forward pass. Returns (preds, targets, time_weight)."""
         scene = self.encode_scene(
-            point_uv, camera_K, rgb=rgb, pcl_xyz=pcl_xyz, pcl_rgb=pcl_rgb
+            point_uv,
+            camera_K,
+            rgb_camera_K=rgb_camera_K,
+            rgb=rgb,
+            pcl_xyz=pcl_xyz,
+            pcl_rgb=pcl_rgb,
+            hand_keypoints_2d=hand_keypoints_2d,
+            hand_keypoints_valid=hand_keypoints_valid,
         )
         output = self.flow(gt_mano_params, scene)
         pred_mano_params = self.flow.recover_x0(output)
@@ -316,12 +342,22 @@ class GraspFlowModel(nn.Module):
         point_uv: torch.Tensor,
         camera_K: torch.Tensor,
         steps: Optional[int] = None,
+        rgb_camera_K: Optional[torch.Tensor] = None,
         rgb: Optional[torch.Tensor] = None,
         pcl_xyz: Optional[torch.Tensor] = None,
         pcl_rgb: Optional[torch.Tensor] = None,
+        hand_keypoints_2d: Optional[torch.Tensor] = None,
+        hand_keypoints_valid: Optional[torch.Tensor] = None,
     ):
         """Generate grasp samples."""
         scene = self.encode_scene(
-            point_uv, camera_K, rgb=rgb, pcl_xyz=pcl_xyz, pcl_rgb=pcl_rgb
+            point_uv,
+            camera_K,
+            rgb_camera_K=rgb_camera_K,
+            rgb=rgb,
+            pcl_xyz=pcl_xyz,
+            pcl_rgb=pcl_rgb,
+            hand_keypoints_2d=hand_keypoints_2d,
+            hand_keypoints_valid=hand_keypoints_valid,
         )
         return self.flow.sample(scene, steps=steps)

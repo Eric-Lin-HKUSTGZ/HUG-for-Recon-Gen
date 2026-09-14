@@ -46,6 +46,7 @@ class AugmentedGraspDataset(GraspDataset):
         query_max_depth: float = 2.0,
         query_depth_cluster_width: float = 0.12,
         augmentation: Optional[Dict] = None,
+        hand_crop: Optional[Dict] = None,
     ):
         super().__init__(
             dataset_path=dataset_path,
@@ -61,6 +62,7 @@ class AugmentedGraspDataset(GraspDataset):
             query_min_depth=query_min_depth,
             query_max_depth=query_max_depth,
             query_depth_cluster_width=query_depth_cluster_width,
+            hand_crop=hand_crop,
         )
         self.augmentation = dict(augmentation or {})
         self.augmentation_enabled = bool(self.augmentation.get("enabled", False))

@@ -396,6 +396,7 @@ def _make_dataset(
         samples_filename=(
             str(samples_filename) if samples_filename is not None else None
         ),
+        hand_crop=data_cfg.get("hand_crop", {}),
     )
     if dataset_cls is AugmentedGraspDataset:
         kwargs["augmentation"] = data_cfg.get("augmentation", {})
@@ -504,6 +505,12 @@ def build_loaders(cfg, train_ds, val_ds, rank, world_size, max_train_samples=Non
         train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
     )
     num_workers = int(cfg.trainer.data.get("num_workers", 0))
+    # Detector objects are intentionally owned by the main process. Loading a
+    # YOLO copy in each validation worker wastes memory and is not fork-safe.
+    detector_crop = bool(
+        cfg.trainer.data.get("hand_crop", {}).get("enabled", False)
+    )
+    val_num_workers = 0 if detector_crop else 2
     train_loader_kwargs = dict(
         batch_size=train_cfg.batch_size,
         sampler=sampler,
@@ -562,7 +569,7 @@ def build_loaders(cfg, train_ds, val_ds, rank, world_size, max_train_samples=Non
                     else None
                 ),
                 shuffle=False,
-                num_workers=2,
+                num_workers=val_num_workers,
                 pin_memory=True,
             )
             val_loaders.append((str(entry.name), loader))
@@ -600,7 +607,7 @@ def build_loaders(cfg, train_ds, val_ds, rank, world_size, max_train_samples=Non
             else None
         ),
         shuffle=False,
-        num_workers=2,
+        num_workers=val_num_workers,
         pin_memory=True,
     )
     return train_loader, [("val", val_loader)], sampler
@@ -731,9 +738,12 @@ def run_val(raw_model, val_loaders, device, bf16, rank, world_size):
                     samples = raw_model.sample(
                         point_uv=batch["point_uv"].to(device),
                         camera_K=batch["camera_K"].to(device),
+                        rgb_camera_K=batch["rgb_camera_K"].to(device),
                         rgb=batch["rgb"].to(device) if "rgb" in batch else None,
                         pcl_xyz=batch["pcl_xyz"].to(device) if "pcl_xyz" in batch else None,
                         pcl_rgb=batch["pcl_rgb"].to(device) if "pcl_rgb" in batch else None,
+                        hand_keypoints_2d=batch["hand_keypoints_2d"].to(device),
+                        hand_keypoints_valid=batch["hand_keypoints_valid"].to(device),
                     )
                     if "mano_params" in batch:
                         preds, targets = raw_model.build_loss_dicts(
@@ -821,7 +831,10 @@ def load_pretrained(model, path, device):
 
         sd = load_file(str(p))
     else:
-        sd = torch.load(str(p), map_location=device, weights_only=False)
+        # Load through CPU to avoid holding an extra full checkpoint copy on
+        # the training GPU during startup. load_compatible_state_dict moves
+        # matching tensors into the already-allocated target model.
+        sd = torch.load(str(p), map_location="cpu", weights_only=False)
         sd = sd.get("model", sd.get("ema", sd))
     sd = {k[len("module."):] if k.startswith("module.") else k: v for k, v in sd.items()}
     ignored_norm_buffers = sorted(_PRETRAINED_NORM_BUFFER_KEYS.intersection(sd))
@@ -1039,6 +1052,9 @@ def main(
                 point_uv=batch["point_uv"].to(device, non_blocking=True),
                 camera_K=batch["camera_K"].to(device, non_blocking=True),
                 gt_mano_params=batch["mano_params"].to(device, non_blocking=True),
+                rgb_camera_K=batch["rgb_camera_K"].to(
+                    device, non_blocking=True
+                ),
                 rgb=batch["rgb"].to(device, non_blocking=True) if "rgb" in batch else None,
                 pcl_xyz=(
                     batch["pcl_xyz"].to(device, non_blocking=True)
@@ -1049,6 +1065,12 @@ def main(
                     batch["pcl_rgb"].to(device, non_blocking=True)
                     if "pcl_rgb" in batch
                     else None
+                ),
+                hand_keypoints_2d=batch["hand_keypoints_2d"].to(
+                    device, non_blocking=True
+                ),
+                hand_keypoints_valid=batch["hand_keypoints_valid"].to(
+                    device, non_blocking=True
                 ),
             )
         loss, comps = compute_loss(

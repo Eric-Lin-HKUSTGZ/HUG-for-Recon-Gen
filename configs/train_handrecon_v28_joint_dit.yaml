@@ -1,16 +1,18 @@
 # HUG 手部重建训练配置（DexYCB-only）
-# 用法: torchrun --nproc_per_node=4 -m src.train --config configs/train_handrecon.yaml
-# 数据: v26 方案 B：完整分辨率 RGBD + shape_gt 一致几何；RGB 在加载时裁手部并缩放到 224。
+# 用法: torchrun --nproc_per_node=4 -m src.train --config configs/train_handrecon_v28_joint_dit.yaml
+# 数据: 沿用 v27 RGB/Depth token 拼接；v28 仅替换去噪器前 2 层为双流联合注意力。
 # 划分: scripts/make_handrecon_splits.py 生成（DexYCB 官方 s0，HO3D 按序列留出）
 # norm_stats: scripts/compute_norm_stats.py（仅训练集，无 test 泄漏）
 
 trainer:
   model:
     # ---- 模态开关（与论文 full model 一致）----
+    # 512-token 融合在 batch/GPU=256 时开启激活重计算，保留有效 batch 与梯度语义。
+    fusion_activation_checkpointing: true
     use_rgb: true
     use_depth: true
     use_2d_point: false
-    use_pointpainting: true
+    use_pointpainting: false  # 方案 B：独立保留 256 RGB + 256 Depth tokens；true 切回 v26 PointPainting
     # ---- RGB 编码器（冻结 DINOv2）----
     # 只编码 hand crop，不再输入全局 RGB，避免背景/物体纹理干扰。
     encoder_name: facebook/dinov2-with-registers-base
@@ -21,7 +23,7 @@ trainer:
     pcl_use_rgb: true
     # ---- 融合 ----
     d_fusion: 1024
-    n_patches: 256
+    n_patches: 256  # 每种模态的 token 数；非 PointPainting 时总长度为 512，勿改成 512
     fusion_layers: 4
     fusion_heads: 8
     patch_grid_size: 16
@@ -37,6 +39,10 @@ trainer:
     # ---- flow transformer (DiT) ----
     d_mano: 109
     d_model: 512
+    # 总层数仍为 6：前 2 层双流联合注意力，后 4 层原有 DiT。
+    # flow_joint_layers: 0 且搭配 v27 权重可恢复原去噪器。
+    flow_joint_layers: 2
+    flow_activation_checkpointing: true  # 逐层激活重计算，控制 516-token 注意力显存
     flow_layers: 6
     flow_heads: 8
     sampling_steps: 50
@@ -158,15 +164,15 @@ trainer:
     heartbeat_every: 20              # 长时间 batch/val/checkpoint 前的存活事件间隔
     val_every: 1000
     ckpt_every: 1000          # 与 val_every 对齐，续训点即评估点
-    output_dir: /root/code/vepfs/HUG-for-Recon-Gen/hand_recon/20260913_v26_oracle_b_fullres
-    log_file: /root/code/vepfs/HUG-for-Recon-Gen/logs/hand_recon/20260913_v26_oracle_b_fullres.jsonl
+    output_dir: /root/code/vepfs/HUG-for-Recon-Gen/hand_recon/20260914_v28_joint_dit
+    log_file: /root/code/vepfs/HUG-for-Recon-Gen/logs/hand_recon/20260914_v28_joint_dit.jsonl
     tensorboard:
       enabled: true
       log_dir: tensorboard          # relative paths are created under output_dir
       flush_secs: 10
       max_queue: 10
     pretrained: /root/code/vepfs/HUG-for-Recon-Gen/hug_checkpoint/hug_full.safetensors  # 与 v24 相同的原始 HUG 预训练初始化；保留 DexYCB norm stats
-    resume: null                  # 想要接着训练，把路径加上即可（注意是model.pt文件）
+    resume: null  # 新架构从原始 HUG 初始化；不可继承 v27 的 optimizer 续训状态
 
   val:                            # 按用户要求：训练中直接用官方 s0_test 评测并选择 best
     max_samples: 4096             # 从完整 test 等距取固定 4096 条，跨 checkpoint 可比

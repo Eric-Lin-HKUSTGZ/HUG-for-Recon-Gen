@@ -14,9 +14,10 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from ..utils.camera_geometry import project_points_torch
-from .transformer import CrossAttentionBlock, TransformerBlock
+from .transformer import CrossAttention, CrossAttentionBlock, TransformerBlock
 
 
 class FourierPosEmbed(nn.Module):
@@ -82,9 +83,13 @@ class PatchFusion(nn.Module):
         fourier_scale: float = 1.0,
         use_2d_point: bool = False,
         query_fusion_mode: str = "legacy_broadcast",
+        use_query_condition: bool = True,
+        use_skeleton_condition: bool = False,
+        activation_checkpointing: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
+        self.activation_checkpointing = bool(activation_checkpointing)
         self.n_patches = n_patches
         self.patch_grid_size = patch_grid_size
         self.use_rgb = use_rgb
@@ -92,6 +97,8 @@ class PatchFusion(nn.Module):
         self.use_pointpainting = use_pointpainting
         self.image_size = image_size
         self.use_2d_point = use_2d_point
+        self.use_query_condition = bool(use_query_condition)
+        self.use_skeleton_condition = bool(use_skeleton_condition)
         if query_fusion_mode not in self.QUERY_FUSION_MODES:
             raise ValueError(
                 f"query_fusion_mode must be one of {self.QUERY_FUSION_MODES}, "
@@ -150,6 +157,44 @@ class PatchFusion(nn.Module):
                 )
                 self.relative_gate = nn.Parameter(torch.tensor(0.1))
 
+        if not self.use_query_condition:
+            # Keep legacy query modules in the state dict for checkpoint
+            # compatibility, but remove them from DDP/optimizer bookkeeping.
+            query_only = [self.point_proj]
+            if hasattr(self, "point_cross_attn"):
+                query_only.append(self.point_cross_attn)
+            if hasattr(self, "query_to_scene_attn"):
+                query_only.append(self.query_to_scene_attn)
+            if hasattr(self, "relative_pos_embed_3d"):
+                query_only.append(self.relative_pos_embed_3d)
+            if hasattr(self, "pos_embed_2d"):
+                query_only.append(self.pos_embed_2d)
+            for module in query_only:
+                for parameter in module.parameters():
+                    parameter.requires_grad = False
+            for name in ("query_context_gate", "relative_gate"):
+                if hasattr(self, name):
+                    getattr(self, name).requires_grad = False
+
+        if self.use_skeleton_condition:
+            # Per-joint input = normalized crop xy (2) + camera ray (3).
+            self.skeleton_input_proj = nn.Sequential(
+                nn.Linear(5, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, d_model),
+            )
+            self.skeleton_joint_embed = nn.Parameter(
+                torch.randn(1, 21, d_model) * 0.02
+            )
+            self.skeleton_scene_norm = nn.RMSNorm(d_model)
+            self.skeleton_context_norm = nn.RMSNorm(d_model)
+            self.skeleton_cross_attn = CrossAttention(
+                d_model, n_heads, dropout=dropout
+            )
+            # Exact old-model behavior at initialization. The new path grows
+            # only when training finds the MediaPipe prior useful.
+            self.skeleton_gate = nn.Parameter(torch.tensor(0.0))
+
         self.transformer = nn.Sequential(
             *[
                 TransformerBlock(d_model, n_heads, dropout=dropout)
@@ -188,6 +233,20 @@ class PatchFusion(nn.Module):
         )
         return painted.squeeze(2).transpose(1, 2)
 
+    def _encode_skeleton(
+        self, keypoints_2d: torch.Tensor, camera_K: torch.Tensor
+    ) -> torch.Tensor:
+        """Encode 21 crop-space keypoints as ray-aware joint tokens."""
+        uv1 = torch.cat(
+            [keypoints_2d, torch.ones_like(keypoints_2d[..., :1])], dim=-1
+        )
+        rays = torch.linalg.solve(
+            camera_K.unsqueeze(1), uv1.unsqueeze(-1)
+        ).squeeze(-1)
+        rays = F.normalize(rays, dim=-1, eps=1e-6)
+        xy = 2.0 * keypoints_2d / max(float(self.image_size - 1), 1.0) - 1.0
+        return self.skeleton_input_proj(torch.cat([xy, rays], dim=-1)) + self.skeleton_joint_embed
+
     def forward(
         self,
         point: torch.Tensor,
@@ -195,6 +254,8 @@ class PatchFusion(nn.Module):
         depth_patches: Optional[torch.Tensor] = None,
         depth_centroids: Optional[torch.Tensor] = None,
         camera_K: Optional[torch.Tensor] = None,
+        hand_keypoints_2d: Optional[torch.Tensor] = None,
+        hand_keypoints_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Fuse RGB + PCL patches with point conditioning.
 
@@ -209,15 +270,18 @@ class PatchFusion(nn.Module):
 
         Returns (B, N_total, d_model) fused token sequence.
         """
-        if self.use_2d_point:
-            point_token = self.pos_embed_2d(point.unsqueeze(1))
-        else:
-            point_token = self.pos_embed_3d(point.unsqueeze(1))
-        point_token = self.point_proj(point_token)
+        point_token = None
+        if self.use_query_condition:
+            if self.use_2d_point:
+                point_token = self.pos_embed_2d(point.unsqueeze(1))
+            else:
+                point_token = self.pos_embed_3d(point.unsqueeze(1))
+            point_token = self.point_proj(point_token)
 
         relative_depth_pos = None
         if (
-            self.query_fusion_mode == "query_to_scene"
+            self.use_query_condition
+            and self.query_fusion_mode == "query_to_scene"
             and not self.use_2d_point
             and depth_centroids is not None
             and hasattr(self, "relative_pos_embed_3d")
@@ -255,13 +319,44 @@ class PatchFusion(nn.Module):
             if relative_depth_pos is not None:
                 x = x + relative_depth_pos
 
-        if self.query_fusion_mode == "legacy_broadcast":
+        if self.use_query_condition and self.query_fusion_mode == "legacy_broadcast":
             x = self.point_cross_attn(x, context=point_token)
-        else:
+        elif self.use_query_condition:
             # Q has length 1 while K/V span the scene. Unlike the legacy
             # direction, softmax now ranks multiple spatial tokens.
             query_context = self.query_to_scene_attn(point_token, context=x)
             x = x + torch.tanh(self.query_context_gate) * query_context
 
-        x = self.transformer(x)
+        if (
+            self.use_skeleton_condition
+            and hand_keypoints_2d is not None
+            and hand_keypoints_valid is not None
+        ):
+            valid = hand_keypoints_valid.bool()
+            valid_any = valid.any(dim=1)
+            # SDPA requires at least one valid key per sample. An all-missing
+            # MediaPipe result uses one zero dummy token and is removed again
+            # by valid_any after attention.
+            safe_valid = valid.clone()
+            safe_valid[~valid_any, 0] = True
+            skeleton = self._encode_skeleton(hand_keypoints_2d, camera_K)
+            skeleton = skeleton * valid.unsqueeze(-1).to(skeleton.dtype)
+            delta = self.skeleton_cross_attn(
+                self.skeleton_scene_norm(x),
+                self.skeleton_context_norm(skeleton),
+                attn_mask=safe_valid,
+            )
+            x = x + (
+                torch.tanh(self.skeleton_gate)
+                * valid_any[:, None, None].to(delta.dtype)
+                * delta
+            )
+
+        if self.activation_checkpointing and self.training and torch.is_grad_enabled():
+            # Recompute one block at a time to bound peak memory. Preserve
+            # dropout RNG and use non-reentrant checkpointing for DDP support.
+            for block in self.transformer:
+                x = checkpoint(block, x, use_reentrant=False, preserve_rng_state=True)
+        else:
+            x = self.transformer(x)
         return x

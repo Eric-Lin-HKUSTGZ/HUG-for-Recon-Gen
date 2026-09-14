@@ -64,7 +64,15 @@ def load_weights(model, ckpt, weights: str) -> None:
         "flow.denoise_fn.shape_mean",
         "flow.denoise_fn.shape_std",
     }
-    bad_missing = [k for k in bad_missing if k not in allowed_missing]
+    legacy_without_skeleton = not any(
+        key.startswith("fusion.skeleton_") for key in sd
+    )
+    bad_missing = [
+        k
+        for k in bad_missing
+        if k not in allowed_missing
+        and not (legacy_without_skeleton and k.startswith("fusion.skeleton_"))
+    ]
     if bad_missing:
         raise RuntimeError(f"missing non-frozen keys: {bad_missing}")
 
@@ -83,10 +91,13 @@ def evaluate_dataset(
                 samples = model.sample(
                     point_uv=batch["point_uv"].to(device),
                     camera_K=batch["camera_K"].to(device),
+                    rgb_camera_K=batch["rgb_camera_K"].to(device),
                     steps=steps,
                     rgb=batch["rgb"].to(device) if "rgb" in batch else None,
                     pcl_xyz=batch["pcl_xyz"].to(device) if "pcl_xyz" in batch else None,
                     pcl_rgb=batch["pcl_rgb"].to(device) if "pcl_rgb" in batch else None,
+                    hand_keypoints_2d=batch["hand_keypoints_2d"].to(device),
+                    hand_keypoints_valid=batch["hand_keypoints_valid"].to(device),
                 )
                 if "mano_params" in batch:  # MANO GT available (DexYCB test)
                     preds, targets = model.build_loss_dicts(
@@ -180,6 +191,7 @@ def main(
         d_mano=int(cfg.trainer.model.get("d_mano", 99)),
         use_rgb=cfg.trainer.model.get("use_rgb", True),
         use_depth=cfg.trainer.model.get("use_depth", True),
+        hand_crop=cfg.trainer.data.get("hand_crop", {}),
     )
     bs = int(batch_size or test_cfg.get("batch_size", 256))
     bf16 = bool(train_cfg.get("bf16", True)) and device.type == "cuda"
@@ -206,7 +218,11 @@ def main(
             batch_size=bs,
             sampler=sampler,
             shuffle=False,
-            num_workers=cfg.trainer.data.num_workers,
+            num_workers=(
+                0
+                if bool(cfg.trainer.data.get("hand_crop", {}).get("enabled", False))
+                else cfg.trainer.data.num_workers
+            ),
             pin_memory=True,
         )
         if is_main(rank):

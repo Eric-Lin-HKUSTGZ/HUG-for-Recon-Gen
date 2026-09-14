@@ -1,6 +1,6 @@
 # HUG 手部重建训练配置（DexYCB-only）
 # 用法: torchrun --nproc_per_node=4 -m src.train --config configs/train_handrecon.yaml
-# 数据: v26 方案 B：完整分辨率 RGBD + shape_gt 一致几何；RGB 在加载时裁手部并缩放到 224。
+# 数据: v25 使用 repair_shape_gt_geometry.py 修复后的 DexYCB；几何字段与 shape_gt 一致。
 # 划分: scripts/make_handrecon_splits.py 生成（DexYCB 官方 s0，HO3D 按序列留出）
 # norm_stats: scripts/compute_norm_stats.py（仅训练集，无 test 泄漏）
 
@@ -49,7 +49,7 @@ trainer:
       # - path: /root/code/vepfs/dataset/hand_recon_hug/ho3d
       #   train_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_train.clean.txt
       #   val_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_val.clean.txt
-      - path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v4_fullres_shape_gt
+      - path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v3_shape_gt_geometry
         train_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_train.clean.txt
         val_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_test.clean.txt
     # Query depth is physically bounded and filtered to the dominant local
@@ -58,7 +58,7 @@ trainer:
     query_max_depth: 2.0
     query_depth_cluster_width: 0.12
     # ---- 尺度自适应手部局部输入 ----
-    # Oracle B v26：完整 RGB 上 train 用 GT bbox、val/test 用 detector bbox；Depth 按关键点圆形 ROI 裁剪。
+    # Oracle A v25：train 用 shape_gt 一致的 GT bbox，val/test 仍用 detector bbox。
     # GT 关键点变换到 RGB crop 坐标后供 skeleton condition 使用；原全图坐标的
     # GT 关键点同时定义 Depth 圆形 ROI，用于隔离 MediaPipe 漏检/抖动的影响。
     # affine 增强先同步作用于全图 RGB/Depth/关键点/query/K；之后 RGB bbox crop
@@ -158,8 +158,8 @@ trainer:
     heartbeat_every: 20              # 长时间 batch/val/checkpoint 前的存活事件间隔
     val_every: 1000
     ckpt_every: 1000          # 与 val_every 对齐，续训点即评估点
-    output_dir: /root/code/vepfs/HUG-for-Recon-Gen/hand_recon/20260913_v26_oracle_b_fullres
-    log_file: /root/code/vepfs/HUG-for-Recon-Gen/logs/hand_recon/20260913_v26_oracle_b_fullres.jsonl
+    output_dir: /root/code/vepfs/HUG-for-Recon-Gen/hand_recon/20260913_v25_oracle_a_shape_gt_geometry
+    log_file: /root/code/vepfs/HUG-for-Recon-Gen/logs/hand_recon/20260913_v25_oracle_a_shape_gt_geometry.jsonl
     tensorboard:
       enabled: true
       log_dir: tensorboard          # relative paths are created under output_dir
@@ -172,7 +172,7 @@ trainer:
     max_samples: 4096             # 从完整 test 等距取固定 4096 条，跨 checkpoint 可比
     datasets:
       - name: dexycb_s0_test_selection  # 注意：test 已参与模型选择，不再是独立盲测
-        path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v4_fullres_shape_gt
+        path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v3_shape_gt_geometry
         samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_test.clean.txt
       # - name: ho3d_eval            # HO3D 官方 evaluation split（跨主体，joints/verts GT）
       #   path: /root/code/vepfs/dataset/hand_recon_hug/ho3d_eval
@@ -183,7 +183,7 @@ trainer:
     out: null                      # 结果 json 输出路径；null 则默认 <output_dir>/test_results.json
     datasets:
       - name: dexycb_test          # DexYCB 官方 s0_test（MANO GT，走 sample+build_loss_dicts）
-        path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v4_fullres_shape_gt
+        path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v3_shape_gt_geometry
         samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_test.clean.txt
       # - name: ho3d_eval            # HO3D_v3 官方 evaluation split（joints/verts GT，无 MANO，走推理路径）
       #   path: /root/code/vepfs/dataset/hand_recon_hug/ho3d_eval

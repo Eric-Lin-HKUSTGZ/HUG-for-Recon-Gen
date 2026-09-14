@@ -59,6 +59,7 @@ class GraspDataset(Dataset):
         query_min_depth: float = 0.15,
         query_max_depth: float = 2.0,
         query_depth_cluster_width: float = 0.12,
+        hand_crop: Optional[Dict] = None,
     ):
         self.dataset_path = Path(dataset_path)
         self.split = split
@@ -70,6 +71,32 @@ class GraspDataset(Dataset):
         self.query_min_depth = max(float(query_min_depth), 0.0)
         self.query_max_depth = float(query_max_depth)
         self.query_depth_cluster_width = max(float(query_depth_cluster_width), 0.0)
+        self.hand_crop = dict(hand_crop or {})
+        self.hand_crop_enabled = bool(self.hand_crop.get("enabled", False))
+        self.hand_crop_expand = max(float(self.hand_crop.get("expand", 1.5)), 1.0)
+        self.depth_radius_expand = max(
+            float(self.hand_crop.get("depth_radius_expand", 1.25)), 1.0
+        )
+        self.detector_weights_path = self.hand_crop.get("detector_weights")
+        self.detector_conf = float(self.hand_crop.get("detector_conf", 0.25))
+        self.detector_iou = float(self.hand_crop.get("detector_iou", 0.7))
+        self.detector_device = str(self.hand_crop.get("detector_device", "cpu"))
+        self.mediapipe_enabled = bool(self.hand_crop.get("mediapipe_enabled", True))
+        self.mediapipe_min_conf = float(
+            self.hand_crop.get("mediapipe_min_detection_confidence", 0.3)
+        )
+        self.keypoint_source = str(
+            self.hand_crop.get("keypoint_source", "mediapipe")
+        ).strip().lower()
+        if self.keypoint_source not in {"mediapipe", "gt"}:
+            raise ValueError(
+                "hand_crop.keypoint_source must be 'mediapipe' or 'gt', got "
+                f"{self.keypoint_source!r}"
+            )
+        # Third-party models are created lazily inside the DataLoader process.
+        # Keeping them out of __init__ makes the dataset safe to pickle/fork.
+        self._hand_detector = None
+        self._mediapipe_hands = None
         if self.query_max_depth <= self.query_min_depth:
             raise ValueError(
                 "query_max_depth must be greater than query_min_depth, got "
@@ -96,6 +123,261 @@ class GraspDataset(Dataset):
             ]
         )
         self.mask_transform = transforms.ToTensor()
+
+    @staticmethod
+    def _bbox_from_keypoints(keypoints: np.ndarray) -> Optional[np.ndarray]:
+        """Tight xyxy box around finite 2D joints."""
+        xy = np.asarray(keypoints, dtype=np.float32).reshape(-1, 2)
+        valid = np.isfinite(xy).all(axis=1)
+        if valid.sum() < 2:
+            return None
+        xy = xy[valid]
+        return np.array(
+            [xy[:, 0].min(), xy[:, 1].min(), xy[:, 0].max(), xy[:, 1].max()],
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _expanded_square_bbox(
+        bbox: np.ndarray, expand: float, min_side: float = 24.0
+    ) -> np.ndarray:
+        """Convert xyxy to an expanded square without clipping the padding."""
+        x1, y1, x2, y2 = np.asarray(bbox, dtype=np.float32).reshape(4)
+        cx, cy = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+        side = max(float(x2 - x1), float(y2 - y1), float(min_side)) * float(expand)
+        half = 0.5 * side
+        return np.array([cx - half, cy - half, cx + half, cy + half], np.float32)
+
+    def _load_detector(self):
+        if self._hand_detector is None:
+            if not self.detector_weights_path:
+                raise ValueError(
+                    "hand_crop.detector_weights is required for val/test detector crop"
+                )
+            try:
+                from ultralytics import YOLO
+            except ImportError as exc:
+                raise ImportError(
+                    "Detector crop requires ultralytics. Run this configuration in "
+                    "the hug_mediapipe environment with ultralytics installed."
+                ) from exc
+            self._hand_detector = YOLO(str(self.detector_weights_path))
+        return self._hand_detector
+
+    def _detect_hand_bbox(self, rgb: np.ndarray) -> Optional[np.ndarray]:
+        """Highest-confidence right-hand YOLO box, falling back to any hand."""
+        detector = self._load_detector()
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        result = detector(
+            bgr,
+            conf=self.detector_conf,
+            iou=self.detector_iou,
+            device=self.detector_device,
+            verbose=False,
+        )[0]
+        if result is None or result.boxes is None or len(result.boxes) == 0:
+            return None
+        boxes = result.boxes.xyxy.detach().cpu().numpy().astype(np.float32)
+        scores = result.boxes.conf.detach().cpu().numpy().astype(np.float32)
+        classes = result.boxes.cls.detach().cpu().numpy().astype(np.float32)
+        right = np.flatnonzero(classes > 0.5)
+        candidates = right if right.size else np.arange(len(scores))
+        return boxes[int(candidates[np.argmax(scores[candidates])])]
+
+    def _select_hand_crop_bbox(
+        self, grasp_data: Dict, rgb: np.ndarray
+    ) -> tuple[np.ndarray, bool, str]:
+        """Use GT joints in train and the requested detector in val/test."""
+        height, width = rgb.shape[:2]
+        if self.split == "train":
+            grasp = grasp_data.get("grasp")
+            bbox = self._bbox_from_keypoints(grasp.get("landmarks_2d")) if grasp else None
+            source = "gt"
+        else:
+            bbox = self._detect_hand_bbox(rgb)
+            source = "detector"
+        if bbox is None:
+            # A miss must not invalidate the sample or couple all modalities to
+            # detector failure. Full-frame local input is the deterministic fallback.
+            return np.array([0.0, 0.0, float(width - 1), float(height - 1)]), False, "full_fallback"
+        return self._expanded_square_bbox(bbox, self.hand_crop_expand), True, source
+
+    @staticmethod
+    def _crop_affine(bbox: np.ndarray, output_size: int) -> np.ndarray:
+        x1, y1, x2, y2 = np.asarray(bbox, dtype=np.float32).reshape(4)
+        sx = float(output_size - 1) / max(float(x2 - x1), 1.0)
+        sy = float(output_size - 1) / max(float(y2 - y1), 1.0)
+        return np.array([[sx, 0.0, -sx * x1], [0.0, sy, -sy * y1]], np.float32)
+
+    @staticmethod
+    def _transform_points(points: np.ndarray, affine: np.ndarray) -> np.ndarray:
+        xy = np.asarray(points, dtype=np.float32)
+        shape = xy.shape
+        flat = xy.reshape(-1, shape[-1]).copy()
+        xy1 = np.concatenate(
+            [flat[:, :2], np.ones((len(flat), 1), dtype=np.float32)], axis=1
+        )
+        flat[:, :2] = xy1 @ affine.T
+        return flat.reshape(shape)
+
+    @staticmethod
+    def _inverse_transform_points(points: np.ndarray, affine: np.ndarray) -> np.ndarray:
+        homography = np.eye(3, dtype=np.float32)
+        homography[:2] = affine
+        inverse = np.linalg.inv(homography).astype(np.float32)[:2]
+        return GraspDataset._transform_points(points, inverse)
+
+    def _crop_rgb(
+        self,
+        rgb: np.ndarray,
+        K: np.ndarray,
+        bbox: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Crop only RGB and return its crop-space camera intrinsics."""
+        affine = self._crop_affine(bbox, self.image_size)
+        size = (self.image_size, self.image_size)
+        rgb_crop = cv2.warpAffine(
+            rgb,
+            affine,
+            size,
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
+        homography = np.eye(3, dtype=np.float32)
+        homography[:2] = affine
+        K_crop = homography @ np.asarray(K, dtype=np.float32)
+        return rgb_crop, K_crop, affine
+
+    def _crop_original_depth_by_keypoint_radius(
+        self,
+        depth_m: torch.Tensor,
+        keypoints_original: np.ndarray,
+        keypoints_valid: np.ndarray,
+    ) -> tuple[torch.Tensor, np.ndarray, float]:
+        """Mask the original depth by a keypoint-derived image-space circle."""
+        depth = depth_m.numpy() if isinstance(depth_m, torch.Tensor) else np.asarray(depth_m)
+        valid = np.asarray(keypoints_valid, dtype=bool)
+        points = np.asarray(keypoints_original, dtype=np.float32)[valid]
+        if len(points) < 2:
+            raise ValueError("keypoint-radius depth crop requires at least two joints")
+        lower = points.min(axis=0)
+        upper = points.max(axis=0)
+        center = 0.5 * (lower + upper)
+        radius = float(np.linalg.norm(points - center[None], axis=1).max())
+        radius = max(radius * self.depth_radius_expand, 8.0)
+        yy, xx = np.ogrid[: depth.shape[0], : depth.shape[1]]
+        mask = (xx - float(center[0])) ** 2 + (yy - float(center[1])) ** 2 <= radius ** 2
+        cropped = np.where(mask, depth, 0.0).astype(np.float32, copy=False)
+        return torch.from_numpy(cropped), center.astype(np.float32), radius
+
+    def _load_mediapipe(self):
+        if self._mediapipe_hands is None:
+            try:
+                import mediapipe as mp
+            except ImportError as exc:
+                raise ImportError(
+                    "MediaPipe skeleton conditioning requires mediapipe. "
+                    "Use the hug_mediapipe environment."
+                ) from exc
+            self._mediapipe_hands = mp.solutions.hands.Hands(
+                static_image_mode=True,
+                max_num_hands=1,
+                model_complexity=1,
+                min_detection_confidence=self.mediapipe_min_conf,
+                min_tracking_confidence=0.5,
+            )
+        return self._mediapipe_hands
+
+    def _mediapipe_keypoints(self, rgb_crop: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return crop-pixel landmarks and a per-joint validity mask."""
+        zeros_xy = np.zeros((21, 2), dtype=np.float32)
+        zeros_valid = np.zeros(21, dtype=np.bool_)
+        if not self.mediapipe_enabled:
+            return zeros_xy, zeros_valid
+        result = self._load_mediapipe().process(np.ascontiguousarray(rgb_crop))
+        if not result.multi_hand_landmarks:
+            return zeros_xy, zeros_valid
+        landmarks = result.multi_hand_landmarks[0].landmark
+        xy = np.asarray(
+            [[lm.x * self.image_size, lm.y * self.image_size] for lm in landmarks],
+            dtype=np.float32,
+        )
+        valid = (
+            np.isfinite(xy).all(axis=1)
+            & (xy[:, 0] >= 0.0)
+            & (xy[:, 0] < self.image_size)
+            & (xy[:, 1] >= 0.0)
+            & (xy[:, 1] < self.image_size)
+        )
+        return np.nan_to_num(xy, nan=0.0, posinf=0.0, neginf=0.0), valid
+
+    def _hand_keypoints(
+        self,
+        grasp_data: Dict,
+        rgb_crop: np.ndarray,
+        rgb_original: np.ndarray,
+        crop_affine: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return crop-space skeleton points and full-frame points for Depth.
+
+        Oracle A replaces only the MediaPipe landmark source with GT. The GT
+        joints are transformed into the detector/GT RGB crop for the skeleton
+        condition, while their original full-frame coordinates define the
+        adaptive Depth ROI. Separate validity masks preserve this distinction:
+        a detector box can exclude a GT joint from the RGB crop without also
+        deleting that joint from the oracle Depth ROI.
+        """
+        if self.keypoint_source == "mediapipe":
+            keypoints_crop, valid_crop = self._mediapipe_keypoints(rgb_crop)
+            keypoints_original = self._inverse_transform_points(
+                keypoints_crop, crop_affine
+            )
+            return keypoints_crop, valid_crop, keypoints_original, valid_crop.copy()
+
+        grasp = grasp_data.get("grasp")
+        landmarks = grasp.get("landmarks_2d") if isinstance(grasp, dict) else None
+        if landmarks is None:
+            raise ValueError(
+                "hand_crop.keypoint_source='gt' requires grasp.landmarks_2d; "
+                "Oracle A is only valid on labeled reconstruction samples"
+            )
+        keypoints_original = np.asarray(landmarks, dtype=np.float32)
+        if keypoints_original.shape != (21, 2):
+            raise ValueError(
+                "Oracle A expects grasp.landmarks_2d with shape (21, 2), got "
+                f"{keypoints_original.shape}"
+            )
+
+        # DexYCB includes valid projections outside the image for partially
+        # visible hands. Keep every finite GT joint: the expanded RGB crop can
+        # include padded image regions, and the full-frame Depth circle is
+        # naturally clipped by the depth image boundary.
+        valid_original = np.isfinite(keypoints_original).all(axis=1)
+        keypoints_crop = self._transform_points(keypoints_original, crop_affine)
+        valid_crop = (
+            valid_original
+            & np.isfinite(keypoints_crop).all(axis=1)
+            & (keypoints_crop[:, 0] >= 0.0)
+            & (keypoints_crop[:, 0] < self.image_size)
+            & (keypoints_crop[:, 1] >= 0.0)
+            & (keypoints_crop[:, 1] < self.image_size)
+        )
+        keypoints_crop = np.nan_to_num(
+            keypoints_crop, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        keypoints_original = np.nan_to_num(
+            keypoints_original, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        return keypoints_crop, valid_crop, keypoints_original, valid_original
+
+    def _palm_anchor(self, keypoints: np.ndarray, valid: np.ndarray) -> np.ndarray:
+        """Stable 2D anchor from wrist and four MCP joints."""
+        palm_ids = np.asarray([0, 5, 9, 13, 17], dtype=np.int64)
+        keep = valid[palm_ids]
+        if keep.any():
+            return np.median(keypoints[palm_ids][keep], axis=0).astype(np.float32)
+        return np.array([0.5 * (self.image_size - 1)] * 2, dtype=np.float32)
 
     def __len__(self) -> int:
         return len(self.grasp_files)
@@ -513,31 +795,131 @@ class GraspDataset(Dataset):
         # (matches app/inference resolution via dataset_path / f"{stem}.pkl").
         stem = grasp_path.relative_to(self.dataset_path).with_suffix("").as_posix()
 
-        # HO3D_v3 eval pkls carry no segmentation mask (official eval set ships
-        # none; object_mask is empty bytes) but always store condition_point.
-        # The mask is only needed to sample a query point when condition_point
-        # is absent, so decode it lazily.
-        stored_uv = grasp_data.get("condition_point")
+        # Depth stays in the full-frame coordinate system (after any shared
+        # affine augmentation). Only the RGB tensor sent to DINO is cropped.
         depth_m = self._depth_meters(grasp_data["depth"])
-        K_np = grasp_data["camera"]["K"]
-        if stored_uv is not None:
-            u, v = float(stored_uv[0]), float(stored_uv[1])
-            depth_np = depth_m.numpy() if isinstance(depth_m, torch.Tensor) else depth_m
-            d = self._robust_depth_at_pixel(depth_np, u, v)
-            point_uv = torch.tensor([u, v, d], dtype=torch.float32)
+        depth_for_pcl = depth_m
+        K_np = np.asarray(grasp_data["camera"]["K"], dtype=np.float32)
+        rgb_original = self._decode_image(grasp_data["image"])
+        rgb_np = rgb_original
+        rgb_K_np = K_np.copy()
+
+        crop_bbox = np.array(
+            [
+                0.0,
+                0.0,
+                float(rgb_original.shape[1] - 1),
+                float(rgb_original.shape[0] - 1),
+            ],
+            dtype=np.float32,
+        )
+        crop_valid = True
+        crop_source = "disabled"
+        crop_affine = np.eye(3, dtype=np.float32)[:2]
+        keypoints_2d = np.zeros((21, 2), dtype=np.float32)
+        keypoints_valid = np.zeros(21, dtype=np.bool_)
+        depth_crop_center = np.zeros(2, dtype=np.float32)
+        # A negative radius explicitly means that no 2D keypoint crop was
+        # applied; that path uses HUG's query-centred metric sphere instead.
+        depth_crop_radius = -1.0
+        has_hand_keypoints = False
+
+        if self.hand_crop_enabled:
+            crop_bbox, crop_valid, crop_source = self._select_hand_crop_bbox(
+                grasp_data, rgb_original
+            )
+            rgb_np, rgb_K_np, crop_affine = self._crop_rgb(
+                rgb_original, K_np, crop_bbox
+            )
+            (
+                keypoints_2d,
+                keypoints_valid,
+                keypoints_original,
+                depth_keypoints_valid,
+            ) = self._hand_keypoints(
+                grasp_data, rgb_np, rgb_original, crop_affine
+            )
+            has_hand_keypoints = int(depth_keypoints_valid.sum()) >= 2
+            if has_hand_keypoints:
+                depth_for_pcl, depth_crop_center, depth_crop_radius = (
+                    self._crop_original_depth_by_keypoint_radius(
+                        depth_m,
+                        keypoints_original,
+                        depth_keypoints_valid,
+                    )
+                )
+                anchor_uv = self._palm_anchor(
+                    keypoints_original, depth_keypoints_valid
+                )
+                d = self._robust_depth_at_pixel(
+                    depth_m.numpy(), float(anchor_uv[0]), float(anchor_uv[1])
+                )
+                point_uv = torch.tensor(
+                    [float(anchor_uv[0]), float(anchor_uv[1]), d], dtype=torch.float32
+                )
+            else:
+                # No skeleton means this may be an object-only generation
+                # sample (or a detector miss). Restore the full RGB view and
+                # retain the original HUG query + metric point-cloud crop.
+                rgb_np = rgb_original
+                rgb_K_np = K_np.copy()
+                crop_bbox = np.array(
+                    [
+                        0.0,
+                        0.0,
+                        float(rgb_original.shape[1] - 1),
+                        float(rgb_original.shape[0] - 1),
+                    ],
+                    dtype=np.float32,
+                )
+                crop_affine = np.eye(3, dtype=np.float32)[:2]
+                crop_valid = False
+                crop_source = f"{crop_source}_no_keypoints_full"
+                stored_uv = grasp_data.get("condition_point")
+                if stored_uv is not None:
+                    u, v = float(stored_uv[0]), float(stored_uv[1])
+                    d = self._robust_depth_at_pixel(depth_m.numpy(), u, v)
+                    point_uv = torch.tensor([u, v, d], dtype=torch.float32)
+                else:
+                    mask_np = self._decode_mask(grasp_data["object_mask"])
+                    mask_tensor = self.mask_transform(Image.fromarray(mask_np))
+                    point_uv = self._sample_point_from_mask(mask_tensor, depth_m)
+                depth_crop_center = point_uv[:2].numpy().copy()
         else:
-            mask_np = self._decode_mask(grasp_data["object_mask"])
-            mask_tensor = self.mask_transform(Image.fromarray(mask_np))
-            point_uv = self._sample_point_from_mask(mask_tensor, depth_m)
+            # Legacy HUG query path retained for old configs/checkpoints and
+            # object-only grasp generation samples.
+            stored_uv = grasp_data.get("condition_point")
+            if stored_uv is not None:
+                u, v = float(stored_uv[0]), float(stored_uv[1])
+                d = self._robust_depth_at_pixel(depth_m.numpy(), u, v)
+                point_uv = torch.tensor([u, v, d], dtype=torch.float32)
+            else:
+                mask_np = self._decode_mask(grasp_data["object_mask"])
+                mask_tensor = self.mask_transform(Image.fromarray(mask_np))
+                point_uv = self._sample_point_from_mask(mask_tensor, depth_m)
 
         camera_K = torch.from_numpy(K_np).float()
-
-        rgb_np = self._decode_image(grasp_data["image"])
+        rgb_camera_K = torch.from_numpy(rgb_K_np).float()
 
         out = {
             "point_uv": point_uv,
             "camera_K": camera_K,
+            "rgb_camera_K": rgb_camera_K,
             "stem": stem,
+            "hand_keypoints_2d": torch.from_numpy(keypoints_2d).float(),
+            "hand_keypoints_valid": torch.from_numpy(keypoints_valid),
+            "hand_crop_bbox": torch.from_numpy(crop_bbox).float(),
+            "hand_crop_valid": torch.tensor(bool(crop_valid)),
+            "hand_crop_source": crop_source,
+            "hand_keypoint_source": (
+                self.keypoint_source if self.hand_crop_enabled else "disabled"
+            ),
+            "depth_crop_center_uv": torch.from_numpy(depth_crop_center).float(),
+            "depth_crop_radius_px": torch.tensor(depth_crop_radius).float(),
+            "has_hand_keypoints": torch.tensor(bool(has_hand_keypoints)),
+            "pcl_crop_mode": (
+                "keypoint_radius" if has_hand_keypoints else "query_sphere"
+            ),
             "query_valid": torch.tensor(
                 self.query_min_depth <= float(point_uv[2]) <= self.query_max_depth
             ),
@@ -549,7 +931,9 @@ class GraspDataset(Dataset):
             shape_key = "shape_gt" if "shape_gt" in grasp else "shape"
             out["mano_shape"] = torch.from_numpy(grasp[shape_key].flatten()).float()
             out["landmarks_3d"] = torch.from_numpy(grasp["landmarks_3d"]).float()
-            out["landmarks_2d"] = torch.from_numpy(grasp["landmarks_2d"]).float()
+            out["landmarks_2d"] = torch.from_numpy(
+                np.asarray(grasp["landmarks_2d"], dtype=np.float32)
+            ).float()
         elif "joints_gt" in grasp_data:
             # HO3D_v3 evaluation split: GT is joints/verts only, no MANO params.
             # Reorder joints from the official raw order to our standard order
@@ -563,8 +947,11 @@ class GraspDataset(Dataset):
         if self.use_rgb:
             out["rgb"] = self.rgb_transform(Image.fromarray(rgb_np))
         if self.use_depth:
+            # A detected skeleton already supplies an adaptive 2D crop, so do
+            # not stack a fixed metric sphere on top. Without a skeleton,
+            # fall back to HUG's query-centred sphere (normally 0.30 m).
             point_xyz = None
-            if bool(out["query_valid"]):
+            if bool(out["query_valid"]) and not has_hand_keypoints:
                 point_xyz = pixel_to_xyz(
                     float(point_uv[0]), float(point_uv[1]), float(point_uv[2]), K_np
                 )
@@ -572,8 +959,8 @@ class GraspDataset(Dataset):
             if self.split != "train":
                 pcl_rng = np.random.default_rng(zlib.crc32(stem.encode("utf-8")))
             xyz, pcl_rgb = self._build_pcl(
-                depth_m,
-                rgb_np,
+                depth_for_pcl,
+                rgb_original,
                 K_np,
                 point_xyz=point_xyz,
                 rng=pcl_rng,
