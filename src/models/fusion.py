@@ -114,6 +114,12 @@ class PatchFusion(nn.Module):
         self.pos_embed_3d = FourierPosEmbed(d_model, in_dim=3, scale=fourier_scale)
         if use_2d_point:
             self.pos_embed_2d = FourierPosEmbed(d_model, in_dim=2, scale=fourier_scale)
+            # RGB-only runs do not consume 3D depth-token positions. Keep the
+            # module for checkpoint compatibility, but freeze its unused
+            # learned projection so DDP does not wait for a nonexistent grad.
+            if not use_depth and self.pos_embed_3d.raw_proj is not None:
+                for parameter in self.pos_embed_3d.raw_proj.parameters():
+                    parameter.requires_grad = False
 
         if use_pointpainting:
             if not (use_rgb and use_depth):
@@ -256,6 +262,7 @@ class PatchFusion(nn.Module):
         camera_K: Optional[torch.Tensor] = None,
         hand_keypoints_2d: Optional[torch.Tensor] = None,
         hand_keypoints_valid: Optional[torch.Tensor] = None,
+        hand_keypoints_confidence: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Fuse RGB + PCL patches with point conditioning.
 
@@ -333,6 +340,12 @@ class PatchFusion(nn.Module):
             and hand_keypoints_valid is not None
         ):
             valid = hand_keypoints_valid.bool()
+            confidence = (
+                hand_keypoints_confidence.float().clamp(0.0, 1.0)
+                if hand_keypoints_confidence is not None
+                else valid.float()
+            )
+            confidence = confidence * valid.float()
             valid_any = valid.any(dim=1)
             # SDPA requires at least one valid key per sample. An all-missing
             # MediaPipe result uses one zero dummy token and is removed again
@@ -345,6 +358,7 @@ class PatchFusion(nn.Module):
                 self.skeleton_scene_norm(x),
                 self.skeleton_context_norm(skeleton),
                 attn_mask=safe_valid,
+                context_weight=confidence,
             )
             x = x + (
                 torch.tanh(self.skeleton_gate)

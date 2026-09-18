@@ -15,7 +15,7 @@ trainer:
     use_pointpainting: false  # 方案 B：独立保留 256 RGB + 256 Depth tokens；true 切回 v26 PointPainting
     # ---- RGB 编码器（冻结 DINOv2）----
     # 只编码 hand crop，不再输入全局 RGB，避免背景/物体纹理干扰。
-    encoder_name: facebook/dinov2-with-registers-base
+    encoder_name: /root/code/vepfs/HUG-for-Recon-Gen/dinov2/hf_with_registers_base  # VEPFS 本地权重，无需联网
     # ---- 点云编码器（可训练 PointNeXt）----
     pcl_width: 64
     pcl_sa_radii: [0.025, 0.05, 0.10, 0.20]

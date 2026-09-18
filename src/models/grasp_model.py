@@ -10,10 +10,12 @@ from rich.console import Console
 
 from ..utils.camera_geometry import backproject_pixels_torch
 from ..utils.data_keys import MANO_RIGHT_SHAPE_FILE, NORM_STATS_FILE
+from ..utils.transform_utils import six_d_to_rotation_matrix
 from .encoders import DINOv2Encoder, PointNeXtEncoder
 from .fusion import PatchFusion
 from .grasp_flow import GraspFlowMatching
 from .mano import MANO
+from .native_mano import NativeCanonicalMANO
 
 console = Console()
 
@@ -66,7 +68,10 @@ class GraspFlowModel(nn.Module):
         d_rgb_patch = 0
         d_depth_patch = 0
         if self.use_rgb:
-            self.image_encoder = DINOv2Encoder(model_name=model_cfg.encoder_name)
+            self.image_encoder = DINOv2Encoder(
+                model_name=model_cfg.encoder_name,
+                tuning=model_cfg.get("image_encoder_tuning", {}),
+            )
             d_rgb_patch = self.image_encoder.output_dim
         if self.use_depth:
             sa_radii = tuple(model_cfg.get("pcl_sa_radii", (0.025, 0.05, 0.10, 0.20)))
@@ -115,7 +120,15 @@ class GraspFlowModel(nn.Module):
         fixed_betas = torch.from_numpy(np.load(MANO_RIGHT_SHAPE_FILE)).float()
         self.register_buffer("fixed_betas", fixed_betas.unsqueeze(0))
 
-        self.mano = MANO()
+        self.mano_geometry = model_cfg.get("mano_geometry", "legacy_right")
+        if self.mano_geometry == "native_side_v1":
+            if self.d_mano != 109:
+                raise ValueError("native_side_v1 requires d_mano=109")
+            self.mano = NativeCanonicalMANO(model_cfg.native_left_asset)
+        elif self.mano_geometry == "legacy_right":
+            self.mano = MANO()
+        else:
+            raise ValueError(f"unknown mano_geometry: {self.mano_geometry}")
         self.mesh_faces = self.mano.mano_layer.get_mano_closed_faces().cpu().numpy()
 
         self.flow = GraspFlowMatching(
@@ -146,6 +159,7 @@ class GraspFlowModel(nn.Module):
         pcl_rgb: Optional[torch.Tensor] = None,
         hand_keypoints_2d: Optional[torch.Tensor] = None,
         hand_keypoints_valid: Optional[torch.Tensor] = None,
+        hand_keypoints_confidence: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Encode scene inputs + query point into condition.
 
@@ -172,8 +186,11 @@ class GraspFlowModel(nn.Module):
 
         rgb_patches = None
         if self.use_rgb:
-            with torch.no_grad():
+            if getattr(self.image_encoder, "is_trainable", False):
                 rgb_patches = self.image_encoder(rgb)
+            else:
+                with torch.no_grad():
+                    rgb_patches = self.image_encoder(rgb)
 
         depth_patches = None
         depth_centroids = None
@@ -190,10 +207,11 @@ class GraspFlowModel(nn.Module):
             camera_K=rgb_camera_K if rgb_camera_K is not None else camera_K,
             hand_keypoints_2d=hand_keypoints_2d,
             hand_keypoints_valid=hand_keypoints_valid,
+            hand_keypoints_confidence=hand_keypoints_confidence,
         )
         return cond
 
-    def mano_forward(self, mano_params, betas=None):
+    def mano_forward(self, mano_params, betas=None, source_is_left=None):
         """Run MANO and return landmarks + rotations in camera frame.
 
         In 109D mode the trailing ten entries are used as per-sample MANO
@@ -202,7 +220,12 @@ class GraspFlowModel(nn.Module):
         """
         if betas is None:
             betas = self.get_betas(mano_params)
-        out = self.mano(mano_params, betas=betas)
+        if getattr(self, "mano_geometry", "legacy_right") == "native_side_v1":
+            out = self.mano(mano_params, betas=betas, source_is_left=source_is_left)
+        else:
+            if source_is_left is not None:
+                raise ValueError("native data requires mano_geometry=native_side_v1")
+            out = self.mano(mano_params, betas=betas)
         t = out["t"].unsqueeze(1)
         out["landmarks_3d"] = out["landmarks_3d"] + t
         out["vertices"] = out["vertices"] + t
@@ -225,9 +248,15 @@ class GraspFlowModel(nn.Module):
         params_norm_pred,
         params_norm_target,
         gt_mano_params,
+        source_is_left=None, gt_joints_3d=None, gt_vertices=None,
     ):
         """Build pred/target dicts from predicted and GT mano params."""
-        pred_out = self.mano_forward(pred_mano_params)
+        native = getattr(self, "mano_geometry", "legacy_right") == "native_side_v1"
+        if native and (source_is_left is None or gt_joints_3d is None or gt_vertices is None):
+            raise ValueError("native_side_v1 requires converted native GT, not regenerated MANO GT")
+        if not native and any(v is not None for v in (source_is_left, gt_joints_3d, gt_vertices)):
+            raise ValueError("native GT cannot be consumed by the legacy geometry path")
+        pred_out = self.mano_forward(pred_mano_params, source_is_left=source_is_left)
         preds = {
             "params_norm": params_norm_pred,
             "mano_params": pred_mano_params,
@@ -237,7 +266,14 @@ class GraspFlowModel(nn.Module):
             "vertices": pred_out["vertices"],
         }
 
-        gt_out = self.mano_forward(gt_mano_params)
+        if native:
+            if gt_joints_3d.shape != pred_out["landmarks_3d"].shape or gt_vertices.shape != pred_out["vertices"].shape:
+                raise ValueError("native joint/mesh target shape mismatch")
+            gt_out = {"t": gt_mano_params[:, :3],
+                      "R_3x3": six_d_to_rotation_matrix(gt_mano_params[:, 3:9].float()),
+                      "landmarks_3d": gt_joints_3d, "vertices": gt_vertices}
+        else:
+            gt_out = self.mano_forward(gt_mano_params)
         targets = {
             "params_norm": params_norm_target,
             "mano_params": gt_mano_params,
@@ -300,6 +336,8 @@ class GraspFlowModel(nn.Module):
         pcl_rgb: Optional[torch.Tensor] = None,
         hand_keypoints_2d: Optional[torch.Tensor] = None,
         hand_keypoints_valid: Optional[torch.Tensor] = None,
+        hand_keypoints_confidence: Optional[torch.Tensor] = None,
+        source_is_left=None, gt_joints_3d=None, gt_vertices=None,
     ):
         """Training forward pass. Returns (preds, targets, time_weight)."""
         scene = self.encode_scene(
@@ -311,6 +349,7 @@ class GraspFlowModel(nn.Module):
             pcl_rgb=pcl_rgb,
             hand_keypoints_2d=hand_keypoints_2d,
             hand_keypoints_valid=hand_keypoints_valid,
+            hand_keypoints_confidence=hand_keypoints_confidence,
         )
         output = self.flow(gt_mano_params, scene)
         pred_mano_params = self.flow.recover_x0(output)
@@ -320,11 +359,12 @@ class GraspFlowModel(nn.Module):
             output["pred"],
             output["target"],
             gt_mano_params,
+            source_is_left=source_is_left, gt_joints_3d=gt_joints_3d, gt_vertices=gt_vertices,
         )
         time_weight = 1.0 - output["t"]
         return preds, targets, time_weight
 
-    def build_loss_dicts(self, samples, gt_mano_params):
+    def build_loss_dicts(self, samples, gt_mano_params, **geometry):
         """Build (preds, targets) dicts from validation samples."""
         preds_norm = self.flow.denoise_fn.normalize(samples)
         targets_norm = self.flow.denoise_fn.normalize(gt_mano_params)
@@ -334,6 +374,7 @@ class GraspFlowModel(nn.Module):
             preds_norm,
             targets_norm,
             gt_mano_params,
+            **geometry,
         )
 
     @torch.no_grad()
@@ -348,6 +389,7 @@ class GraspFlowModel(nn.Module):
         pcl_rgb: Optional[torch.Tensor] = None,
         hand_keypoints_2d: Optional[torch.Tensor] = None,
         hand_keypoints_valid: Optional[torch.Tensor] = None,
+        hand_keypoints_confidence: Optional[torch.Tensor] = None,
     ):
         """Generate grasp samples."""
         scene = self.encode_scene(
@@ -359,5 +401,6 @@ class GraspFlowModel(nn.Module):
             pcl_rgb=pcl_rgb,
             hand_keypoints_2d=hand_keypoints_2d,
             hand_keypoints_valid=hand_keypoints_valid,
+            hand_keypoints_confidence=hand_keypoints_confidence,
         )
         return self.flow.sample(scene, steps=steps)

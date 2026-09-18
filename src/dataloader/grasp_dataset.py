@@ -1,7 +1,9 @@
 """Grasp dataset for training and evaluation."""
 
 import logging
+import os
 import pickle
+import sys
 import zlib
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -15,6 +17,7 @@ from torchvision import transforms
 
 from ..utils.data_keys import MANO_RIGHT_MESH_FACES_FILE, MANO_RIGHT_SHAPE_FILE
 from ..utils.pcl_utils import depth_to_pcl_tensors, pixel_to_xyz
+from .geometry_overlay import GeometryOverlay
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +63,7 @@ class GraspDataset(Dataset):
         query_max_depth: float = 2.0,
         query_depth_cluster_width: float = 0.12,
         hand_crop: Optional[Dict] = None,
+        geometry_overlay: Optional[str] = None,
     ):
         self.dataset_path = Path(dataset_path)
         self.split = split
@@ -73,10 +77,26 @@ class GraspDataset(Dataset):
         self.query_depth_cluster_width = max(float(query_depth_cluster_width), 0.0)
         self.hand_crop = dict(hand_crop or {})
         self.hand_crop_enabled = bool(self.hand_crop.get("enabled", False))
+        self.geometry_overlay = None
+        if geometry_overlay:
+            if not self.hand_crop_enabled or d_mano != 109:
+                raise ValueError("native geometry overlay requires hand_crop.enabled and d_mano=109")
+            self.geometry_overlay = GeometryOverlay(geometry_overlay, self.dataset_path)
         self.hand_crop_expand = max(float(self.hand_crop.get("expand", 1.5)), 1.0)
         self.depth_radius_expand = max(
             float(self.hand_crop.get("depth_radius_expand", 1.25)), 1.0
         )
+        self.depth_detector_expand = max(
+            float(self.hand_crop.get("depth_detector_expand", 1.15)), 1.0
+        )
+        self.skeleton_drop_prob = min(
+            max(float(self.hand_crop.get("skeleton_drop_prob", 0.0)), 0.0), 1.0
+        )
+        self.condition_cache_path = str(
+            self.hand_crop.get("condition_cache", "") or ""
+        )
+        self._condition_cache = None
+        self._condition_cache_index = None
         self.detector_weights_path = self.hand_crop.get("detector_weights")
         self.detector_conf = float(self.hand_crop.get("detector_conf", 0.25))
         self.detector_iou = float(self.hand_crop.get("detector_iou", 0.7))
@@ -85,18 +105,44 @@ class GraspDataset(Dataset):
         self.mediapipe_min_conf = float(
             self.hand_crop.get("mediapipe_min_detection_confidence", 0.3)
         )
+        source_key = (
+            "train_keypoint_source" if self.split == "train"
+            else "eval_keypoint_source"
+        )
         self.keypoint_source = str(
-            self.hand_crop.get("keypoint_source", "mediapipe")
+            self.hand_crop.get(
+                source_key,
+                self.hand_crop.get("keypoint_source", "mediapipe"),
+            )
         ).strip().lower()
-        if self.keypoint_source not in {"mediapipe", "gt"}:
+        if self.keypoint_source not in {"mediapipe", "rtmpose", "rtmpose_cache", "gt"}:
             raise ValueError(
-                "hand_crop.keypoint_source must be 'mediapipe' or 'gt', got "
+                f"hand_crop.{source_key}/keypoint_source must be "
+                "'mediapipe', 'rtmpose', 'rtmpose_cache', or 'gt', got "
                 f"{self.keypoint_source!r}"
             )
+        self.rtmpose_config_path = str(self.hand_crop.get("rtmpose_config", ""))
+        self.rtmpose_checkpoint_path = str(
+            self.hand_crop.get("rtmpose_checkpoint", "")
+        )
+        self.rtmpose_device = str(
+            self.hand_crop.get("rtmpose_device", "auto")
+        ).strip().lower()
+        self.rtmpose_min_joint_conf = float(
+            self.hand_crop.get("rtmpose_min_joint_confidence", 0.1)
+        )
+        self.rtmpose_min_mean_conf = float(
+            self.hand_crop.get("rtmpose_min_mean_confidence", 0.0)
+        )
+        self.rtmpose_python_paths = [
+            str(path)
+            for path in self.hand_crop.get("rtmpose_python_paths", [])
+        ]
         # Third-party models are created lazily inside the DataLoader process.
         # Keeping them out of __init__ makes the dataset safe to pickle/fork.
         self._hand_detector = None
         self._mediapipe_hands = None
+        self._rtmpose_runtime = None
         if self.query_max_depth <= self.query_min_depth:
             raise ValueError(
                 "query_max_depth must be greater than query_min_depth, got "
@@ -114,6 +160,12 @@ class GraspDataset(Dataset):
 
         if indices is not None:
             self.grasp_files = [self.grasp_files[i] for i in indices]
+
+        if self.geometry_overlay is not None:
+            self.geometry_overlay.validate_samples([
+                p.relative_to(self.dataset_path).with_suffix("").as_posix()
+                for p in self.grasp_files
+            ])
 
         # Image transforms (ImageNet normalization for DINOv2)
         self.rgb_transform = transforms.Compose(
@@ -148,6 +200,63 @@ class GraspDataset(Dataset):
         half = 0.5 * side
         return np.array([cx - half, cy - half, cx + half, cy + half], np.float32)
 
+    def _load_condition_cache(self):
+        """Load the immutable detector/RTMPose cache and verify sample order."""
+        if self._condition_cache is not None:
+            return self._condition_cache
+        if not self.condition_cache_path:
+            raise ValueError(
+                "hand_crop.condition_cache is required for keypoint_source='rtmpose_cache'"
+            )
+        path = Path(self.condition_cache_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"condition cache not found: {path}")
+        with np.load(path, allow_pickle=False) as loaded:
+            required = {
+                "sample", "detector_bbox_xyxy", "crop_bbox_xyxy", "detector_hit",
+                "keypoints_xy", "keypoint_scores", "pose_returned",
+            }
+            missing = sorted(required.difference(loaded.files))
+            if missing:
+                raise ValueError(f"condition cache missing fields: {missing}")
+            cache = {key: np.asarray(loaded[key]) for key in required}
+        samples = cache["sample"].astype(str)
+        expected = np.asarray(
+            [p.relative_to(self.dataset_path).with_suffix("").as_posix()
+             for p in self.grasp_files], dtype=str
+        )
+        if len(samples) == len(expected) and np.array_equal(samples, expected):
+            self._condition_cache_index = None
+        else:
+            index = {sample: i for i, sample in enumerate(samples.tolist())}
+            missing_samples = [sample for sample in expected if sample not in index]
+            if missing_samples:
+                raise ValueError(
+                    f"condition cache does not cover dataset samples; first missing={missing_samples[0]}"
+                )
+            self._condition_cache_index = np.asarray(
+                [index[sample] for sample in expected], dtype=np.int64
+            )
+        if cache["keypoints_xy"].shape[1:] != (21, 2):
+            raise ValueError(f"condition cache keypoints shape is {cache['keypoints_xy'].shape}")
+        if cache["keypoint_scores"].shape[1:] != (21,):
+            raise ValueError(f"condition cache scores shape is {cache['keypoint_scores'].shape}")
+        self._condition_cache = cache
+        logger.info("loaded condition cache %s (%d rows)", path, len(samples))
+        return cache
+
+    def _condition_for_sample(self, idx: int) -> Dict[str, np.ndarray | bool]:
+        cache = self._load_condition_cache()
+        row = int(self._condition_cache_index[idx]) if self._condition_cache_index is not None else int(idx)
+        return {
+            "detector_bbox_xyxy": cache["detector_bbox_xyxy"][row].astype(np.float32),
+            "crop_bbox_xyxy": cache["crop_bbox_xyxy"][row].astype(np.float32),
+            "detector_hit": bool(cache["detector_hit"][row]),
+            "keypoints_xy": cache["keypoints_xy"][row].astype(np.float32),
+            "keypoint_scores": cache["keypoint_scores"][row].astype(np.float32),
+            "pose_returned": bool(cache["pose_returned"][row]),
+        }
+
     def _load_detector(self):
         if self._hand_detector is None:
             if not self.detector_weights_path:
@@ -168,11 +277,16 @@ class GraspDataset(Dataset):
         """Highest-confidence right-hand YOLO box, falling back to any hand."""
         detector = self._load_detector()
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        detector_device = self.detector_device
+        if detector_device == "auto":
+            detector_device = (
+                torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+            )
         result = detector(
             bgr,
             conf=self.detector_conf,
             iou=self.detector_iou,
-            device=self.detector_device,
+            device=detector_device,
             verbose=False,
         )[0]
         if result is None or result.boxes is None or len(result.boxes) == 0:
@@ -185,11 +299,16 @@ class GraspDataset(Dataset):
         return boxes[int(candidates[np.argmax(scores[candidates])])]
 
     def _select_hand_crop_bbox(
-        self, grasp_data: Dict, rgb: np.ndarray
+        self, grasp_data: Dict, rgb: np.ndarray,
+        condition: Optional[Dict[str, np.ndarray | bool]] = None,
     ) -> tuple[np.ndarray, bool, str]:
-        """Use GT joints in train and the requested detector in val/test."""
+        """Select a deployment bbox, optionally from the offline cache."""
         height, width = rgb.shape[:2]
-        if self.split == "train":
+        if condition is not None:
+            if bool(condition["detector_hit"]):
+                return np.asarray(condition["crop_bbox_xyxy"], np.float32), True, "detector_cache"
+            return np.array([0.0, 0.0, float(width - 1), float(height - 1)]), False, "detector_cache_miss"
+        if self.split == "train" and self.keypoint_source == "gt":
             grasp = grasp_data.get("grasp")
             bbox = self._bbox_from_keypoints(grasp.get("landmarks_2d")) if grasp else None
             source = "gt"
@@ -254,6 +373,7 @@ class GraspDataset(Dataset):
         depth_m: torch.Tensor,
         keypoints_original: np.ndarray,
         keypoints_valid: np.ndarray,
+        detector_bbox: Optional[np.ndarray] = None,
     ) -> tuple[torch.Tensor, np.ndarray, float]:
         """Mask the original depth by a keypoint-derived image-space circle."""
         depth = depth_m.numpy() if isinstance(depth_m, torch.Tensor) else np.asarray(depth_m)
@@ -268,6 +388,14 @@ class GraspDataset(Dataset):
         radius = max(radius * self.depth_radius_expand, 8.0)
         yy, xx = np.ogrid[: depth.shape[0], : depth.shape[1]]
         mask = (xx - float(center[0])) ** 2 + (yy - float(center[1])) ** 2 <= radius ** 2
+        if detector_bbox is not None:
+            safe_box = self._expanded_square_bbox(
+                detector_bbox, self.depth_detector_expand, min_side=8.0
+            )
+            mask |= (
+                (xx >= float(safe_box[0])) & (xx <= float(safe_box[2]))
+                & (yy >= float(safe_box[1])) & (yy <= float(safe_box[3]))
+            )
         cropped = np.where(mask, depth, 0.0).astype(np.float32, copy=False)
         return torch.from_numpy(cropped), center.astype(np.float32), radius
 
@@ -312,28 +440,170 @@ class GraspDataset(Dataset):
         )
         return np.nan_to_num(xy, nan=0.0, posinf=0.0, neginf=0.0), valid
 
+    def _load_rtmpose(self):
+        """Lazily construct one RTMPose model per eval/DDP process."""
+        if self._rtmpose_runtime is not None:
+            return self._rtmpose_runtime
+        if not self.rtmpose_config_path or not Path(self.rtmpose_config_path).is_file():
+            raise FileNotFoundError(
+                f"hand_crop.rtmpose_config not found: {self.rtmpose_config_path}"
+            )
+        if (
+            not self.rtmpose_checkpoint_path
+            or not Path(self.rtmpose_checkpoint_path).is_file()
+        ):
+            raise FileNotFoundError(
+                "hand_crop.rtmpose_checkpoint not found: "
+                f"{self.rtmpose_checkpoint_path}"
+            )
+
+        # The project runtime intentionally remains the HUG environment. Only
+        # the missing OpenMMLab packages are resolved from the local pose env.
+        for python_path in self.rtmpose_python_paths:
+            if python_path and python_path not in sys.path:
+                sys.path.append(python_path)
+        os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+        try:
+            from mmengine.dataset import Compose, pseudo_collate
+            from mmengine.registry import init_default_scope
+            from mmpose.apis import init_model
+        except ImportError as exc:
+            raise ImportError(
+                "RTMPose requires local MMPose/MMEngine/MMCV packages. Check "
+                "hand_crop.rtmpose_python_paths or run "
+                "scripts/setup_rtmpose_hand5.sh."
+            ) from exc
+
+        if self.rtmpose_device == "auto":
+            device = (
+                f"cuda:{torch.cuda.current_device()}"
+                if torch.cuda.is_available()
+                else "cpu"
+            )
+        else:
+            device = self.rtmpose_device
+        # Some managed multi-GPU runtimes expose only the process-local GPU in
+        # CUDA_VISIBLE_DEVICES while retaining torchrun's LOCAL_RANK=1..N.
+        # MMEngine's logger indexes the former with the latter during model
+        # construction. RTMPose already receives the resolved torch device,
+        # so temporarily use logger-local rank zero for this initialization.
+        saved_local_rank = os.environ.get("LOCAL_RANK")
+        os.environ["LOCAL_RANK"] = "0"
+        try:
+            model = init_model(
+                self.rtmpose_config_path,
+                self.rtmpose_checkpoint_path,
+                device=device,
+                # Hand5 uses CSPNeXt. The identical MMPose implementation avoids
+                # importing unused compiled MMDetection/MMCV operators.
+                cfg_options={"model.backbone._scope_": "mmpose"},
+            )
+        finally:
+            if saved_local_rank is None:
+                os.environ.pop("LOCAL_RANK", None)
+            else:
+                os.environ["LOCAL_RANK"] = saved_local_rank
+        init_default_scope(model.cfg.get("default_scope", "mmpose"))
+        model.eval()
+        pipeline = Compose(model.cfg.test_dataloader.dataset.pipeline)
+        self._rtmpose_runtime = (model, pipeline, pseudo_collate)
+        return self._rtmpose_runtime
+
+    def _rtmpose_keypoints(
+        self,
+        rgb_original: np.ndarray,
+        crop_bbox: np.ndarray,
+        crop_affine: np.ndarray,
+        detector_hit: bool,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Predict Hand5 joints and return crop/full-frame coordinates.
+
+        RTMPose is top-down and always emits 21 joints for a supplied box. A
+        detector miss is therefore rejected before pose inference instead of
+        treating an arbitrary full-frame skeleton as a valid hand.
+        """
+        zeros_xy = np.zeros((21, 2), dtype=np.float32)
+        zeros_valid = np.zeros(21, dtype=np.bool_)
+        if not detector_hit:
+            return zeros_xy, zeros_valid, np.zeros(21, np.float32), zeros_xy.copy(), zeros_valid.copy()
+
+        model, pipeline, pseudo_collate = self._load_rtmpose()
+        bgr = cv2.cvtColor(rgb_original, cv2.COLOR_RGB2BGR)
+        data_info = {
+            "img": bgr,
+            "bbox": np.asarray(crop_bbox, dtype=np.float32).reshape(1, 4),
+            "bbox_score": np.ones(1, dtype=np.float32),
+        }
+        data_info.update(model.dataset_meta)
+        with torch.inference_mode():
+            result = model.test_step(pseudo_collate([pipeline(data_info)]))[0]
+        instance = result.pred_instances
+        keypoints_original = np.asarray(instance.keypoints[0], dtype=np.float32)
+        scores = np.asarray(instance.keypoint_scores[0], dtype=np.float32)
+        if keypoints_original.shape != (21, 2) or scores.shape != (21,):
+            logger.warning(
+                "RTMPose returned unexpected shapes keypoints=%s scores=%s",
+                keypoints_original.shape,
+                scores.shape,
+            )
+            return zeros_xy, zeros_valid, np.zeros(21, np.float32), zeros_xy.copy(), zeros_valid.copy()
+
+        finite = np.isfinite(keypoints_original).all(axis=1) & np.isfinite(scores)
+        if not finite.any() or float(scores[finite].mean()) < self.rtmpose_min_mean_conf:
+            return zeros_xy, zeros_valid, np.zeros(21, np.float32), zeros_xy.copy(), zeros_valid.copy()
+        valid_original = finite & (scores >= self.rtmpose_min_joint_conf)
+        keypoints_crop = self._transform_points(keypoints_original, crop_affine)
+        valid_crop = (
+            valid_original
+            & np.isfinite(keypoints_crop).all(axis=1)
+            & (keypoints_crop[:, 0] >= 0.0)
+            & (keypoints_crop[:, 0] < self.image_size)
+            & (keypoints_crop[:, 1] >= 0.0)
+            & (keypoints_crop[:, 1] < self.image_size)
+        )
+        keypoints_original = np.nan_to_num(
+            keypoints_original, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        keypoints_crop = np.nan_to_num(
+            keypoints_crop, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        confidence = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        confidence[~finite] = 0.0
+        return keypoints_crop, valid_crop, confidence, keypoints_original, valid_original
+
     def _hand_keypoints(
         self,
         grasp_data: Dict,
         rgb_crop: np.ndarray,
         rgb_original: np.ndarray,
         crop_affine: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        crop_bbox: np.ndarray,
+        detector_hit: bool,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Return crop-space skeleton points and full-frame points for Depth.
 
-        Oracle A replaces only the MediaPipe landmark source with GT. The GT
-        joints are transformed into the detector/GT RGB crop for the skeleton
-        condition, while their original full-frame coordinates define the
-        adaptive Depth ROI. Separate validity masks preserve this distinction:
-        a detector box can exclude a GT joint from the RGB crop without also
-        deleting that joint from the oracle Depth ROI.
+        Train and eval sources may differ. GT retains Oracle training, while
+        MediaPipe/RTMPose provide deployment-time predictions. Original-frame
+        points define the adaptive Depth ROI and crop-space points condition
+        the visual fusion module.
         """
         if self.keypoint_source == "mediapipe":
             keypoints_crop, valid_crop = self._mediapipe_keypoints(rgb_crop)
             keypoints_original = self._inverse_transform_points(
                 keypoints_crop, crop_affine
             )
-            return keypoints_crop, valid_crop, keypoints_original, valid_crop.copy()
+            confidence = valid_crop.astype(np.float32)
+            return keypoints_crop, valid_crop, confidence, keypoints_original, valid_crop.copy()
+        if self.keypoint_source == "rtmpose":
+            return self._rtmpose_keypoints(
+                rgb_original,
+                crop_bbox,
+                crop_affine,
+                detector_hit,
+            )
+
+        if self.keypoint_source == "rtmpose_cache":
+            raise RuntimeError("cached keypoints must be passed through _hand_keypoints_cached")
 
         grasp = grasp_data.get("grasp")
         landmarks = grasp.get("landmarks_2d") if isinstance(grasp, dict) else None
@@ -369,15 +639,43 @@ class GraspDataset(Dataset):
         keypoints_original = np.nan_to_num(
             keypoints_original, nan=0.0, posinf=0.0, neginf=0.0
         )
-        return keypoints_crop, valid_crop, keypoints_original, valid_original
+        confidence = valid_original.astype(np.float32)
+        return keypoints_crop, valid_crop, confidence, keypoints_original, valid_original
 
-    def _palm_anchor(self, keypoints: np.ndarray, valid: np.ndarray) -> np.ndarray:
-        """Stable 2D anchor from wrist and four MCP joints."""
+    def _hand_keypoints_cached(
+        self, condition: Dict[str, np.ndarray | bool], crop_affine: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        keypoints_original = np.asarray(condition["keypoints_xy"], np.float32)
+        confidence = np.asarray(condition["keypoint_scores"], np.float32)
+        finite = np.isfinite(keypoints_original).all(axis=1) & np.isfinite(confidence)
+        confidence = np.nan_to_num(confidence, nan=0.0, posinf=0.0, neginf=0.0)
+        confidence[~finite] = 0.0
+        valid_original = finite & (confidence >= self.rtmpose_min_joint_conf)
+        keypoints_crop = self._transform_points(keypoints_original, crop_affine)
+        valid_crop = valid_original & np.isfinite(keypoints_crop).all(axis=1)
+        valid_crop &= (keypoints_crop[:, 0] >= 0.0) & (keypoints_crop[:, 0] < self.image_size)
+        valid_crop &= (keypoints_crop[:, 1] >= 0.0) & (keypoints_crop[:, 1] < self.image_size)
+        keypoints_original = np.nan_to_num(keypoints_original, nan=0.0, posinf=0.0, neginf=0.0)
+        keypoints_crop = np.nan_to_num(keypoints_crop, nan=0.0, posinf=0.0, neginf=0.0)
+        return keypoints_crop, valid_crop, confidence, keypoints_original, valid_original
+
+    def _palm_anchor(
+        self, keypoints: np.ndarray, confidence: np.ndarray, valid: np.ndarray
+    ) -> Optional[np.ndarray]:
+        """Confidence-weighted coordinate-wise median of wrist + MCP joints."""
         palm_ids = np.asarray([0, 5, 9, 13, 17], dtype=np.int64)
-        keep = valid[palm_ids]
-        if keep.any():
-            return np.median(keypoints[palm_ids][keep], axis=0).astype(np.float32)
-        return np.array([0.5 * (self.image_size - 1)] * 2, dtype=np.float32)
+        keep = valid[palm_ids] & (confidence[palm_ids] >= self.rtmpose_min_joint_conf)
+        if int(keep.sum()) < 2:
+            return None
+        points = keypoints[palm_ids][keep]
+        weights = np.maximum(confidence[palm_ids][keep], 1e-6)
+        out = []
+        for axis in range(2):
+            order = np.argsort(points[:, axis])
+            values, sorted_weights = points[order, axis], weights[order]
+            threshold = 0.5 * sorted_weights.sum()
+            out.append(float(values[np.searchsorted(np.cumsum(sorted_weights), threshold, side="left")]))
+        return np.asarray(out, dtype=np.float32)
 
     def __len__(self) -> int:
         return len(self.grasp_files)
@@ -428,7 +726,12 @@ class GraspDataset(Dataset):
 
     def _load_grasp_data(self, grasp_path: Path) -> Dict:
         with open(grasp_path, "rb") as f:
-            return pickle.load(f)
+            record = pickle.load(f)
+        overlay = getattr(self, "geometry_overlay", None)
+        if overlay is not None:
+            stem = grasp_path.relative_to(self.dataset_path).with_suffix("").as_posix()
+            record = overlay.apply(stem, record)
+        return record
 
     def _get_mano_params(self, grasp_data) -> torch.Tensor:
         """Extract 109D MANO state including the ten shape coefficients.
@@ -778,6 +1081,8 @@ class GraspDataset(Dataset):
             "depth_image": depth_image,
             "mano_shape": mano_shape,
         }
+        if grasp_data.get("schema_version") == "dexycb_native_geometry_v1":
+            out["source_is_left"] = grasp_data["source_mano_side"] == "left"
         if self.use_rgb:
             out["rgb"] = self.rgb_transform(Image.fromarray(rgb_np))
         if self.use_depth:
@@ -794,6 +1099,11 @@ class GraspDataset(Dataset):
         # Root-relative stem so nested layouts round-trip back to the pkl path
         # (matches app/inference resolution via dataset_path / f"{stem}.pkl").
         stem = grasp_path.relative_to(self.dataset_path).with_suffix("").as_posix()
+        condition = (
+            self._condition_for_sample(idx)
+            if self.hand_crop_enabled and self.keypoint_source == "rtmpose_cache"
+            else None
+        )
 
         # Depth stays in the full-frame coordinate system (after any shared
         # affine augmentation). Only the RGB tensor sent to DINO is cropped.
@@ -818,6 +1128,9 @@ class GraspDataset(Dataset):
         crop_affine = np.eye(3, dtype=np.float32)[:2]
         keypoints_2d = np.zeros((21, 2), dtype=np.float32)
         keypoints_valid = np.zeros(21, dtype=np.bool_)
+        keypoint_confidence = np.zeros(21, dtype=np.float32)
+        keypoints_original = np.zeros((21, 2), dtype=np.float32)
+        depth_keypoints_valid = np.zeros(21, dtype=np.bool_)
         depth_crop_center = np.zeros(2, dtype=np.float32)
         # A negative radius explicitly means that no 2D keypoint crop was
         # applied; that path uses HUG's query-centred metric sphere instead.
@@ -826,19 +1139,43 @@ class GraspDataset(Dataset):
 
         if self.hand_crop_enabled:
             crop_bbox, crop_valid, crop_source = self._select_hand_crop_bbox(
-                grasp_data, rgb_original
+                grasp_data, rgb_original, condition
             )
             rgb_np, rgb_K_np, crop_affine = self._crop_rgb(
                 rgb_original, K_np, crop_bbox
             )
-            (
-                keypoints_2d,
-                keypoints_valid,
-                keypoints_original,
-                depth_keypoints_valid,
-            ) = self._hand_keypoints(
-                grasp_data, rgb_np, rgb_original, crop_affine
-            )
+            if condition is not None:
+                (
+                    keypoints_2d,
+                    keypoints_valid,
+                    keypoint_confidence,
+                    keypoints_original,
+                    depth_keypoints_valid,
+                ) = self._hand_keypoints_cached(condition, crop_affine)
+            else:
+                (
+                    keypoints_2d,
+                    keypoints_valid,
+                    keypoint_confidence,
+                    keypoints_original,
+                    depth_keypoints_valid,
+                ) = self._hand_keypoints(
+                    grasp_data,
+                    rgb_np,
+                    rgb_original,
+                    crop_affine,
+                    crop_bbox,
+                    crop_valid,
+                )
+            if (
+                self.split == "train"
+                and self.skeleton_drop_prob > 0.0
+                and np.random.random() < self.skeleton_drop_prob
+            ):
+                keypoints_valid[:] = False
+                depth_keypoints_valid[:] = False
+                keypoint_confidence[:] = 0.0
+                crop_source = f"{crop_source}_skeleton_drop"
             has_hand_keypoints = int(depth_keypoints_valid.sum()) >= 2
             if has_hand_keypoints:
                 depth_for_pcl, depth_crop_center, depth_crop_radius = (
@@ -846,11 +1183,24 @@ class GraspDataset(Dataset):
                         depth_m,
                         keypoints_original,
                         depth_keypoints_valid,
+                        detector_bbox=(
+                            condition["detector_bbox_xyxy"]
+                            if condition is not None and bool(condition["detector_hit"])
+                            else None
+                        ),
                     )
                 )
                 anchor_uv = self._palm_anchor(
-                    keypoints_original, depth_keypoints_valid
+                    keypoints_original, keypoint_confidence, depth_keypoints_valid
                 )
+                if anchor_uv is None:
+                    # ROI remains available, but the palm anchor is unreliable.
+                    # Use the detector crop center, never a labeled mask.
+                    anchor_uv = np.asarray(
+                        [(crop_bbox[0] + crop_bbox[2]) * 0.5,
+                         (crop_bbox[1] + crop_bbox[3]) * 0.5],
+                        dtype=np.float32,
+                    )
                 d = self._robust_depth_at_pixel(
                     depth_m.numpy(), float(anchor_uv[0]), float(anchor_uv[1])
                 )
@@ -858,32 +1208,24 @@ class GraspDataset(Dataset):
                     [float(anchor_uv[0]), float(anchor_uv[1]), d], dtype=torch.float32
                 )
             else:
-                # No skeleton means this may be an object-only generation
-                # sample (or a detector miss). Restore the full RGB view and
-                # retain the original HUG query + metric point-cloud crop.
-                rgb_np = rgb_original
-                rgb_K_np = K_np.copy()
-                crop_bbox = np.array(
-                    [
-                        0.0,
-                        0.0,
-                        float(rgb_original.shape[1] - 1),
-                        float(rgb_original.shape[0] - 1),
-                    ],
-                    dtype=np.float32,
-                )
-                crop_affine = np.eye(3, dtype=np.float32)[:2]
-                crop_valid = False
-                crop_source = f"{crop_source}_no_keypoints_full"
-                stored_uv = grasp_data.get("condition_point")
-                if stored_uv is not None:
-                    u, v = float(stored_uv[0]), float(stored_uv[1])
-                    d = self._robust_depth_at_pixel(depth_m.numpy(), u, v)
-                    point_uv = torch.tensor([u, v, d], dtype=torch.float32)
+                # Keep a detector crop when available. When no box exists,
+                # use the full-frame center and depth only; do not use the
+                # converted GT mesh mask to manufacture a query.
+                if not crop_valid:
+                    crop_bbox = np.array(
+                        [0.0, 0.0, float(rgb_original.shape[1] - 1),
+                         float(rgb_original.shape[0] - 1)], dtype=np.float32
+                    )
+                    rgb_np, rgb_K_np, crop_affine = self._crop_rgb(
+                        rgb_original, K_np, crop_bbox
+                    )
+                    crop_source = f"{crop_source}_no_keypoints_full"
                 else:
-                    mask_np = self._decode_mask(grasp_data["object_mask"])
-                    mask_tensor = self.mask_transform(Image.fromarray(mask_np))
-                    point_uv = self._sample_point_from_mask(mask_tensor, depth_m)
+                    crop_source = f"{crop_source}_no_keypoints"
+                u = float((crop_bbox[0] + crop_bbox[2]) * 0.5)
+                v = float((crop_bbox[1] + crop_bbox[3]) * 0.5)
+                d = self._robust_depth_at_pixel(depth_m.numpy(), u, v)
+                point_uv = torch.tensor([u, v, d], dtype=torch.float32)
                 depth_crop_center = point_uv[:2].numpy().copy()
         else:
             # Legacy HUG query path retained for old configs/checkpoints and
@@ -908,6 +1250,7 @@ class GraspDataset(Dataset):
             "stem": stem,
             "hand_keypoints_2d": torch.from_numpy(keypoints_2d).float(),
             "hand_keypoints_valid": torch.from_numpy(keypoints_valid),
+            "hand_keypoints_confidence": torch.from_numpy(keypoint_confidence).float(),
             "hand_crop_bbox": torch.from_numpy(crop_bbox).float(),
             "hand_crop_valid": torch.tensor(bool(crop_valid)),
             "hand_crop_source": crop_source,
@@ -928,6 +1271,18 @@ class GraspDataset(Dataset):
         grasp = grasp_data.get("grasp")
         if grasp is not None:
             out["mano_params"] = self._get_mano_params(grasp_data)
+            if grasp_data.get("schema_version") == "dexycb_native_geometry_v1":
+                if grasp_data.get("mano_parameter_convention") != "source_beta_canonical_pose_v1":
+                    raise ValueError("invalid native MANO parameter convention")
+                side = grasp_data.get("source_mano_side")
+                expected = "camera_x_reflection" if side == "left" else "none"
+                if side not in ("left", "right") or grasp_data.get("canonicalization") != expected:
+                    raise ValueError("invalid native hand-side metadata")
+                if self.d_mano != 109:
+                    raise ValueError("native geometry requires 109D parameters")
+                out["source_is_left"] = torch.tensor(side == "left", dtype=torch.bool)
+                out["gt_joints_3d"] = torch.as_tensor(grasp["landmarks_3d"], dtype=torch.float32)
+                out["gt_vertices"] = torch.as_tensor(grasp["mesh_vertices"], dtype=torch.float32)
             shape_key = "shape_gt" if "shape_gt" in grasp else "shape"
             out["mano_shape"] = torch.from_numpy(grasp[shape_key].flatten()).float()
             out["landmarks_3d"] = torch.from_numpy(grasp["landmarks_3d"]).float()

@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from manotorch.manolayer import ManoLayer
-from manotorch.utils.geometry import rotation_to_axis_angle
+from manotorch.utils.geometry import axis_angle_to_matrix, rotation_to_axis_angle
 
 from ..utils.data_keys import MANO_MODELS_FOLDER
 from ..utils.transform_utils import six_d_to_rotation_matrix
@@ -129,6 +129,7 @@ def mano_params_to_grasp_dict(
     mano_model: MANO,
     camera_K: np.ndarray,
     mesh_faces: np.ndarray,
+    source_is_left: bool = None,
 ) -> dict:
     """Convert 99D model output to full Grasp-format dict (all numpy).
 
@@ -145,7 +146,10 @@ def mano_params_to_grasp_dict(
 
     t, R_6d, pose_6d = mano_model.decode_mano_params(params)
 
-    out = mano_model(params, betas=shape)
+    geometry = {}
+    if source_is_left is not None:
+        geometry["source_is_left"] = torch.tensor([source_is_left], device=device, dtype=torch.bool)
+    out = mano_model(params, betas=shape, **geometry)
     joints_wrist = out["landmarks_3d"][0]
     verts_wrist = out["vertices"][0]
     R_3x3 = out["R_3x3"][0]
@@ -187,6 +191,7 @@ def mano_params_to_animation(
     n_frames: int = 64,
     pre_offset_m: tuple[float, float] = (0.03, 0.03),
     thumb_pre_bend_rad: float = 1.0,
+    source_is_left: bool = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Batched MANO verts + joints for the pre-grasp -> grasp lerp (phase A).
 
@@ -226,12 +231,31 @@ def mano_params_to_animation(
     alphas = torch.linspace(0.0, 1.0, n_frames, device=device).reshape(-1, 1, 1)
     finger_seq = (1.0 - alphas) * finger_start_aa + alphas * pose_aa  # (n, 15, 3)
 
-    pose_coeffs = torch.cat(
-        [R_aa.expand(n_frames, 3), finger_seq.reshape(n_frames, 45)], dim=-1
-    )
-    out = mano_model.mano_layer(pose_coeffs, shape.expand(n_frames, -1))
-    verts = out.verts  # (n, 778, 3), wrist frame
-    joints = out.joints  # (n, 21, 3), wrist frame
+    if source_is_left is None:
+        pose_coeffs = torch.cat(
+            [R_aa.expand(n_frames, 3), finger_seq.reshape(n_frames, 45)], dim=-1
+        )
+        out = mano_model.mano_layer(pose_coeffs, shape.expand(n_frames, -1))
+        verts, joints = out.verts, out.joints
+    else:
+        finger_rot = axis_angle_to_matrix(finger_seq.reshape(-1, 3)).reshape(
+            n_frames, 15, 3, 3
+        )
+        pose_6d_seq = finger_rot[..., :2].reshape(n_frames, 90)
+        # Translation is added by pos_seq below. Keep beta in the source-side
+        # basis and use the same handedness that canonicalized the input image.
+        sequence = torch.cat(
+            [torch.zeros(n_frames, 3, device=device),
+             R_6d.expand(n_frames, 6), pose_6d_seq,
+             shape.expand(n_frames, 10)], dim=-1
+        )
+        out = mano_model(
+            sequence,
+            source_is_left=torch.full(
+                (n_frames,), source_is_left, device=device, dtype=torch.bool
+            ),
+        )
+        verts, joints = out["vertices"], out["landmarks_3d"]
 
     t_grasp = t[0]  # (3,)
     t_pre = t_grasp + R_3x3[0] @ torch.tensor(

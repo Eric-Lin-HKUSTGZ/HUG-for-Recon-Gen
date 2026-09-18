@@ -140,6 +140,7 @@ def load_model(
     # Surface the PCL crop config so apps can rebuild PCLs at click time
     # with the same crop the model was trained with.
     model.pcl_crop_radius = cfg.trainer.model.get("pcl_crop_radius", 0.3)
+    model.inference_data_config = cfg.trainer.data
     return model
 
 
@@ -192,6 +193,16 @@ def main(
     use_depth = getattr(model, "use_depth", False)
     use_rgb = getattr(model, "use_rgb", True)
     pcl_use_rgb = getattr(model, "pcl_use_rgb", False)
+    native = getattr(model, "mano_geometry", "legacy_right") == "native_side_v1"
+    native_data = getattr(model, "inference_data_config", {})
+    native_kwargs = {}
+    if native:
+        native_kwargs = {
+            "hand_crop": native_data.get("hand_crop", {}),
+            "geometry_overlay": native_data.get("geometry_overlay"),
+        }
+        if not native_kwargs["geometry_overlay"]:
+            raise ValueError("native dataset inference requires geometry_overlay with source handedness")
     dataset = GraspDataset(
         str(dataset_path),
         split="val",
@@ -199,6 +210,7 @@ def main(
         use_rgb=use_rgb,
         use_depth=use_depth,
         d_mano=int(getattr(model.flow, "d_mano", 99)),
+        **native_kwargs,
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
@@ -232,6 +244,12 @@ def main(
                 rgb=rgb,
                 pcl_xyz=pcl_xyz,
                 pcl_rgb=pcl_rgb,
+                **({
+                    "rgb_camera_K": batch["rgb_camera_K"].to(device),
+                    "hand_keypoints_2d": batch["hand_keypoints_2d"].to(device),
+                    "hand_keypoints_valid": batch["hand_keypoints_valid"].to(device),
+                    "hand_keypoints_confidence": batch["hand_keypoints_confidence"].to(device),
+                } if native else {}),
             )
         if device == "cuda":
             torch.cuda.synchronize()
@@ -257,12 +275,16 @@ def main(
                 CameraIntrinsics(**cam_orig) if isinstance(cam_orig, dict) else cam_orig
             )
 
+            source_is_left = bool(batch["source_is_left"][i]) if native else None
+            faces = (model.mano.faces_for_side(source_is_left).cpu().numpy()
+                     if native else model.mesh_faces)
             grasp_dict = mano_params_to_grasp_dict(
                 samples[i],
                 model.get_betas(samples[i]),
                 model.mano,
                 camera.K,
-                model.mesh_faces,
+                faces,
+                source_is_left=source_is_left,
             )
             # Encode the normalized sampled point (u, v) in object_mask as 8 bytes
             # of float32 so visualize_predictions can decode it.

@@ -86,6 +86,7 @@ class CrossAttention(nn.Module):
         x: torch.Tensor,
         context: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
+        context_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, N, C = x.shape
         _, M, _ = context.shape
@@ -97,6 +98,8 @@ class CrossAttention(nn.Module):
         kv = self.kv_proj(context).reshape(B, M, 2, self.n_heads, self.head_dim)
         kv = kv.permute(2, 0, 3, 1, 4)  # (2, B, H, M, D)
         k, v = kv.unbind(0)
+        if context_weight is not None:
+            v = v * context_weight[:, None, :, None].to(dtype=v.dtype)
         q = self.q_norm(q)
         k = self.k_norm(k)
         # attn_mask: (B, M) bool, True=valid → expand to (B, 1, 1, M) for SDPA

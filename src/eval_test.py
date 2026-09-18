@@ -21,22 +21,39 @@ Usage (multi-GPU shards the sets):
 import json
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 import torch
 from omegaconf import OmegaConf
 from rich.console import Console
 from rich.table import Table
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, Sampler
 
 from .dataloader.grasp_dataset import GraspDataset
 from .metrics import joint_mesh_errors
 from .models.grasp_model import GraspFlowModel
+from .models.native_mano import geometry_kwargs_from_batch
 from .train import is_main, setup_ddp
 
 console = Console()
 
 METRIC_KEYS = ("mpjpe", "pa_mpjpe", "mpvpe", "pa_mpvpe")
+
+
+class DistributedEvalSampler(Sampler[int]):
+    """Shard evaluation indices without DistributedSampler's tail padding."""
+
+    def __init__(self, dataset, num_replicas: int, rank: int):
+        self.dataset = dataset
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self) -> int:
+        remaining = len(self.dataset) - self.rank
+        return max(0, (remaining + self.num_replicas - 1) // self.num_replicas)
 
 
 def load_weights(model, ckpt, weights: str) -> None:
@@ -84,6 +101,8 @@ def evaluate_dataset(
     model.eval()
     sums = {k: 0.0 for k in METRIC_KEYS}
     n = 0
+    keypoint_samples = 0
+    valid_keypoints = 0
     t0 = time.perf_counter()
     with torch.no_grad():
         for i, batch in enumerate(loader):
@@ -98,10 +117,12 @@ def evaluate_dataset(
                     pcl_rgb=batch["pcl_rgb"].to(device) if "pcl_rgb" in batch else None,
                     hand_keypoints_2d=batch["hand_keypoints_2d"].to(device),
                     hand_keypoints_valid=batch["hand_keypoints_valid"].to(device),
+                    hand_keypoints_confidence=batch["hand_keypoints_confidence"].to(device),
                 )
                 if "mano_params" in batch:  # MANO GT available (DexYCB test)
                     preds, targets = model.build_loss_dicts(
-                        samples, batch["mano_params"].to(device)
+                        samples, batch["mano_params"].to(device),
+                        **geometry_kwargs_from_batch(batch, device),
                     )
                     errs = joint_mesh_errors(
                         preds["landmarks_3d"].float(),
@@ -120,6 +141,8 @@ def evaluate_dataset(
             for k in METRIC_KEYS:
                 sums[k] += errs[k].float().sum().item()
             n += errs["mpjpe"].shape[0]
+            keypoint_samples += int(batch["has_hand_keypoints"].sum().item())
+            valid_keypoints += int(batch["hand_keypoints_valid"].sum().item())
             if is_main(rank) and (i + 1) % 50 == 0:
                 dt = time.perf_counter() - t0
                 console.print(
@@ -127,14 +150,25 @@ def evaluate_dataset(
                 )
 
     # shard -> global sums/counts
-    stats = torch.tensor([sums[k] for k in METRIC_KEYS] + [float(n)], device=device)
+    stats = torch.tensor(
+        [sums[k] for k in METRIC_KEYS]
+        + [float(n), float(keypoint_samples), float(valid_keypoints)],
+        device=device,
+    )
     if world_size > 1:
         torch.distributed.all_reduce(stats)
+    global_n = max(stats[len(METRIC_KEYS)].item(), 1.0)
     means = {
-        k: float(stats[i] / max(stats[-1].item(), 1.0))
+        k: float(stats[i] / global_n)
         for i, k in enumerate(METRIC_KEYS)
     }
-    means["n_samples"] = int(stats[-1].item())
+    means["n_samples"] = int(stats[len(METRIC_KEYS)].item())
+    means["keypoint_sample_coverage"] = float(
+        stats[len(METRIC_KEYS) + 1] / global_n
+    )
+    means["mean_valid_keypoints"] = float(
+        stats[len(METRIC_KEYS) + 2] / global_n
+    )
     means["seconds"] = round(time.perf_counter() - t0, 1)
     return means
 
@@ -192,6 +226,7 @@ def main(
         use_rgb=cfg.trainer.model.get("use_rgb", True),
         use_depth=cfg.trainer.model.get("use_depth", True),
         hand_crop=cfg.trainer.data.get("hand_crop", {}),
+        geometry_overlay=cfg.trainer.data.get("geometry_overlay"),
     )
     bs = int(batch_size or test_cfg.get("batch_size", 256))
     bf16 = bool(train_cfg.get("bf16", True)) and device.type == "cuda"
@@ -209,7 +244,7 @@ def main(
         if limit is not None:
             ds.grasp_files = ds.grasp_files[: int(limit)]
         sampler = (
-            DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=False)
+            DistributedEvalSampler(ds, num_replicas=world_size, rank=rank)
             if world_size > 1
             else None
         )
@@ -239,10 +274,14 @@ def main(
         table.add_column("n", justify="right")
         for k in METRIC_KEYS:
             table.add_column(k.upper(), justify="right")
+        table.add_column("KP COVER", justify="right")
+        table.add_column("VALID KP", justify="right")
         for name, r in results.items():
             table.add_row(
                 name, str(r["n_samples"]),
                 *[f"{r[k]:.2f}" for k in METRIC_KEYS],
+                f"{100.0 * r['keypoint_sample_coverage']:.2f}%",
+                f"{r['mean_valid_keypoints']:.2f}",
             )
         console.print(table)
 
@@ -251,9 +290,21 @@ def main(
         )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
+            "config": str(config),
             "ckpt": str(ckpt_path),
             "weights": weights,
             "step": loaded.get("step"),
+            "sampling_steps": int(
+                steps or cfg.trainer.model.get("sampling_steps", 50)
+            ),
+            "eval_keypoint_source": str(
+                cfg.trainer.data.get("hand_crop", {}).get(
+                    "eval_keypoint_source",
+                    cfg.trainer.data.get("hand_crop", {}).get(
+                        "keypoint_source", "mediapipe"
+                    ),
+                )
+            ),
             "results": results,
         }
         with open(out_path, "w") as f:

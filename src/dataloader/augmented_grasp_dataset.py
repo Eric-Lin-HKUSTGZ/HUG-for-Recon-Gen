@@ -47,6 +47,7 @@ class AugmentedGraspDataset(GraspDataset):
         query_depth_cluster_width: float = 0.12,
         augmentation: Optional[Dict] = None,
         hand_crop: Optional[Dict] = None,
+        geometry_overlay: Optional[str] = None,
     ):
         super().__init__(
             dataset_path=dataset_path,
@@ -63,6 +64,7 @@ class AugmentedGraspDataset(GraspDataset):
             query_max_depth=query_max_depth,
             query_depth_cluster_width=query_depth_cluster_width,
             hand_crop=hand_crop,
+            geometry_overlay=geometry_overlay,
         )
         self.augmentation = dict(augmentation or {})
         self.augmentation_enabled = bool(self.augmentation.get("enabled", False))
@@ -224,6 +226,11 @@ class AugmentedGraspDataset(GraspDataset):
                 else 0.0
             ),
             "affine_params": affine_params,
+            # Filled only after the geometric transform passes the visibility
+            # checks and is actually applied to the sample. Cached detector
+            # conditions must follow this matrix, not merely the sampled params.
+            "applied_affine_matrix": None,
+            "affine_output_shape": None,
         }
 
     @staticmethod
@@ -260,6 +267,18 @@ class AugmentedGraspDataset(GraspDataset):
         return flat.reshape(arr.shape)
 
     @staticmethod
+    def _transform_bbox_xyxy(bbox, matrix: np.ndarray) -> np.ndarray:
+        """Transform all four bbox corners and return their axis-aligned bounds."""
+        x1, y1, x2, y2 = np.asarray(bbox, dtype=np.float32).reshape(4)
+        corners = np.asarray(
+            [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32
+        )
+        transformed = AugmentedGraspDataset._transform_points(corners, matrix)
+        lower = transformed.min(axis=0)
+        upper = transformed.max(axis=0)
+        return np.asarray([lower[0], lower[1], upper[0], upper[1]], np.float32)
+
+    @staticmethod
     def _encode_rgb(rgb_np: np.ndarray) -> bytes:
         bgr = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
         ok, encoded = cv2.imencode(".png", bgr)
@@ -276,6 +295,12 @@ class AugmentedGraspDataset(GraspDataset):
 
     def _apply_affine_to_grasp_data(self, grasp_data: Dict, params: Dict[str, float]) -> Dict:
         """Warp all image-space fields in one copied sample dictionary."""
+        state = self._augmentation_state
+        if state is not None:
+            # A visibility check below may reject the sampled transform. Reset
+            # these fields first so cached conditions stay unmodified then.
+            state["applied_affine_matrix"] = None
+            state["affine_output_shape"] = None
         # Pickle samples are freshly loaded for each item. Shallow-copy the
         # top-level and the two nested dictionaries we mutate instead of
         # deepcopying potentially large label arrays on every training item.
@@ -374,6 +399,9 @@ class AugmentedGraspDataset(GraspDataset):
             grasp["landmarks_2d"] = self._transform_points(
                 grasp["landmarks_2d"], matrix
             )
+        if state is not None:
+            state["applied_affine_matrix"] = matrix.copy()
+            state["affine_output_shape"] = (height, width)
         return data
 
     def _load_grasp_data(self, grasp_path):
@@ -384,6 +412,44 @@ class AugmentedGraspDataset(GraspDataset):
         return self._apply_affine_to_grasp_data(
             grasp_data, state["affine_params"]
         )
+
+    def _condition_for_sample(self, idx: int) -> Dict[str, np.ndarray | bool]:
+        """Map cached detector/pose outputs into the augmented full-image frame."""
+        condition = super()._condition_for_sample(idx)
+        state = self._augmentation_state
+        if state is None or state.get("applied_affine_matrix") is None:
+            return condition
+
+        matrix = np.asarray(state["applied_affine_matrix"], dtype=np.float32)
+        height, width = state["affine_output_shape"]
+
+        if bool(condition["detector_hit"]):
+            detector_bbox = self._transform_bbox_xyxy(
+                condition["detector_bbox_xyxy"], matrix
+            )
+            condition["detector_bbox_xyxy"] = detector_bbox
+            # Preserve the detector-crop contract after rotation: form a new
+            # square crop with the configured padding around the transformed
+            # axis-aligned detector box.
+            condition["crop_bbox_xyxy"] = self._expanded_square_bbox(
+                detector_bbox, self.hand_crop_expand
+            )
+
+        if bool(condition["pose_returned"]):
+            keypoints = self._transform_points(condition["keypoints_xy"], matrix)
+            scores = np.asarray(condition["keypoint_scores"], np.float32).copy()
+            in_frame = (
+                np.isfinite(keypoints).all(axis=1)
+                & (keypoints[:, 0] >= 0.0)
+                & (keypoints[:, 0] <= width - 1)
+                & (keypoints[:, 1] >= 0.0)
+                & (keypoints[:, 1] <= height - 1)
+            )
+            scores[~in_frame] = 0.0
+            condition["keypoints_xy"] = keypoints.astype(np.float32, copy=False)
+            condition["keypoint_scores"] = scores
+
+        return condition
 
     def get_augmented_for_viz(self, idx: int, seed: Optional[int] = None) -> Dict[str, object]:
         """Return one deterministic augmented sample for alignment inspection.

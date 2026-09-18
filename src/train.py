@@ -57,6 +57,7 @@ from .dataloader.augmented_grasp_dataset import AugmentedGraspDataset
 from .dataloader.grasp_dataset import GraspDataset
 from .metrics import joint_mesh_errors
 from .models.grasp_model import GraspFlowModel
+from .models.native_mano import geometry_kwargs_from_batch
 from .utils.data_keys import NORM_STATS_FILE
 
 logger = logging.getLogger("hug.train")
@@ -397,6 +398,7 @@ def _make_dataset(
             str(samples_filename) if samples_filename is not None else None
         ),
         hand_crop=data_cfg.get("hand_crop", {}),
+        geometry_overlay=data_cfg.get("geometry_overlay"),
     )
     if dataset_cls is AugmentedGraspDataset:
         kwargs["augmentation"] = data_cfg.get("augmentation", {})
@@ -744,10 +746,12 @@ def run_val(raw_model, val_loaders, device, bf16, rank, world_size):
                         pcl_rgb=batch["pcl_rgb"].to(device) if "pcl_rgb" in batch else None,
                         hand_keypoints_2d=batch["hand_keypoints_2d"].to(device),
                         hand_keypoints_valid=batch["hand_keypoints_valid"].to(device),
+                        hand_keypoints_confidence=batch["hand_keypoints_confidence"].to(device),
                     )
                     if "mano_params" in batch:
                         preds, targets = raw_model.build_loss_dicts(
-                            samples, batch["mano_params"].to(device)
+                            samples, batch["mano_params"].to(device),
+                            **geometry_kwargs_from_batch(batch, device),
                         )
                         errs = joint_mesh_errors(
                             preds["landmarks_3d"].float(),
@@ -783,10 +787,62 @@ def run_val(raw_model, val_loaders, device, bf16, rank, world_size):
 # --------------------------------------------------------------------------
 
 def _strip_frozen_encoder(state):
-    """Drop frozen DINOv2 tensors from a state dict (reloadable from HF at
-    inference; inference.py:load_model builds the encoder then loads with
-    strict=False). Cuts ~700MB from each saved copy."""
-    return {k: v for k, v in state.items() if not k.startswith("image_encoder.")}
+    """Drop frozen DINOv2 tensors while retaining trainable LoRA adapters."""
+    kept = {}
+    for key, value in state.items():
+        normalized = key[len("module.") :] if key.startswith("module.") else key
+        is_image_encoder = normalized.startswith("image_encoder.")
+        is_lora = ".lora_A" in normalized or ".lora_B" in normalized
+        if not is_image_encoder or is_lora:
+            kept[key] = value
+    return kept
+
+
+def _build_optimizer(model, train_cfg):
+    """Build main and image-adapter groups with independently scheduled LRs."""
+    lora_parameters = []
+    image_encoder = getattr(model, "image_encoder", None)
+    if image_encoder is not None and getattr(image_encoder, "is_trainable", False):
+        lora_parameters = [
+            parameter
+            for _, parameter in image_encoder.lora_named_parameters()
+            if parameter.requires_grad
+        ]
+        if not lora_parameters:
+            raise ValueError("LoRA mode enabled but no trainable adapter parameters found")
+    lora_ids = {id(parameter) for parameter in lora_parameters}
+    main_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and id(parameter) not in lora_ids
+    ]
+    groups = []
+    if main_parameters:
+        groups.append(
+            {
+                "params": main_parameters,
+                "lr": float(train_cfg.lr),
+                "lr_scale": 1.0,
+                "name": "main",
+            }
+        )
+    if lora_parameters:
+        image_lr = float(train_cfg.get("image_encoder_lr", train_cfg.lr))
+        groups.append(
+            {
+                "params": lora_parameters,
+                "lr": image_lr,
+                "lr_scale": image_lr / float(train_cfg.lr),
+                "weight_decay": float(train_cfg.get("image_encoder_weight_decay", 0.0)),
+                "name": "image_encoder_lora",
+            }
+        )
+    return torch.optim.AdamW(
+        groups,
+        lr=float(train_cfg.lr),
+        betas=tuple(train_cfg.betas),
+        weight_decay=float(train_cfg.weight_decay),
+    )
 
 
 def save_checkpoint(path, raw_model, ema_model, optimizer, cfg, norm_stats, step, best_val=None):
@@ -808,6 +864,7 @@ def save_checkpoint(path, raw_model, ema_model, optimizer, cfg, norm_stats, step
         "step": step,
         "best_val": best_val,
         "val_metric": VAL_METRIC,  # metric semantics for best_val comparisons
+        "mano_geometry": getattr(raw_model, "mano_geometry", "legacy_right"),
     }
     tmp = path.with_suffix(".tmp.pt")
     torch.save(ckpt, tmp)
@@ -946,11 +1003,20 @@ def main(
         else model
     )
 
-    optimizer = torch.optim.AdamW(
-        (p for p in model.parameters() if p.requires_grad),
-        lr=train_cfg.lr,
-        betas=tuple(train_cfg.betas),
-        weight_decay=train_cfg.weight_decay,
+    optimizer = _build_optimizer(model, train_cfg)
+    trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    lora_count = sum(
+        p.numel()
+        for group in optimizer.param_groups
+        if group.get("name") == "image_encoder_lora"
+        for p in group["params"]
+    )
+    logger.info(
+        "optimizer ready: trainable=%d image_encoder_lora=%d groups=%s",
+        trainable_count,
+        lora_count,
+        [(group.get("name"), group["lr"]) for group in optimizer.param_groups],
+        extra=log_context,
     )
 
     ema_model = AveragedModel(
@@ -962,6 +1028,9 @@ def main(
     best_val = float("inf")
     if train_cfg.get("resume"):
         ckpt = torch.load(train_cfg.resume, map_location=device, weights_only=False)
+        expected_geometry = getattr(model, "mano_geometry", "legacy_right")
+        if ckpt.get("mano_geometry", "legacy_right") != expected_geometry:
+            raise ValueError("cannot resume across MANO geometry conventions; start a new experiment")
         # strict=False: checkpoints no longer store the frozen DINOv2 encoder
         model.load_compatible_state_dict(ckpt["model"])
         if ckpt.get("optimizer"):
@@ -1038,7 +1107,8 @@ def main(
     for step in range(start_step, int(train_cfg.total_steps)):
         lr = lr_at(step)
         for g in optimizer.param_groups:
-            g["lr"] = lr
+            g["lr"] = lr * float(g.get("lr_scale", 1.0))
+        optimizer.zero_grad(set_to_none=True)
 
         step_no = step + 1
         exception_state["step"] = step_no
@@ -1052,6 +1122,7 @@ def main(
                 point_uv=batch["point_uv"].to(device, non_blocking=True),
                 camera_K=batch["camera_K"].to(device, non_blocking=True),
                 gt_mano_params=batch["mano_params"].to(device, non_blocking=True),
+                **geometry_kwargs_from_batch(batch, device),
                 rgb_camera_K=batch["rgb_camera_K"].to(
                     device, non_blocking=True
                 ),
@@ -1070,6 +1141,9 @@ def main(
                     device, non_blocking=True
                 ),
                 hand_keypoints_valid=batch["hand_keypoints_valid"].to(
+                    device, non_blocking=True
+                ),
+                hand_keypoints_confidence=batch["hand_keypoints_confidence"].to(
                     device, non_blocking=True
                 ),
             )

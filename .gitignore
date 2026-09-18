@@ -265,5 +265,5 @@ samples.txt
 assets/*
 
 # docs
-strategy_docs/
-analysis_docs/
+strategy_docs
+analysis_docs

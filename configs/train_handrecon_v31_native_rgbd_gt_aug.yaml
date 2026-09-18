@@ -1,8 +1,10 @@
+# v31 native RGB-D + GT joints + augmentation experiment.
 # HUG 手部重建训练配置（DexYCB-only）
-# 用法: torchrun --nproc_per_node=4 -m src.train --config configs/train_handrecon_v28_joint_dit.yaml
-# 数据: 沿用 v27 RGB/Depth token 拼接；v28 仅替换去噪器前 2 层为双流联合注意力。
+# 用法: torchrun --nproc_per_node=4 -m src.train --config configs/train_handrecon_v31_native_rgbd_gt_aug.yaml
+# 数据: v30 native 几何不变；train/val/test 均使用 GT 2D joints，不加载 RTMPose/cache。
 # 划分: scripts/make_handrecon_splits.py 生成（DexYCB 官方 s0，HO3D 按序列留出）
-# norm_stats: scripts/compute_norm_stats.py（仅训练集，无 test 泄漏）
+# 初始化: 从 HUG 预训练权重加载模型参数，然后从 step 0 重新训练；不 resume 旧实验。
+# norm_stats: geometry overlay 构建时仅由 394193 个训练样本计算，无 val/test 泄漏。
 
 trainer:
   model:
@@ -33,10 +35,13 @@ trainer:
     query_fusion_mode: legacy_broadcast
     # 单手重建不需要点击点选择目标；point_uv 仅作为局部点云裁剪 anchor。
     use_query_condition: false
-    # Oracle A 的 GT 21 点以相机射线 token 的形式做零初始化门控条件。
+    # GT 21 点以相机射线 token 形式注入 skeleton condition。
     use_skeleton_condition: true
     dropout: 0.1
     # ---- flow transformer (DiT) ----
+    # Beta remains in its source MANO basis; pose/image are canonical right.
+    mano_geometry: native_side_v1
+    native_left_asset: /root/code/vepfs/GPGFormer/weights/mano/MANO_LEFT.pkl
     d_mano: 109
     d_model: 512
     # 总层数仍为 6：前 2 层双流联合注意力，后 4 层原有 DiT。
@@ -51,6 +56,8 @@ trainer:
     pcl_crop_radius: 0.3
 
   data:
+    # Original full-resolution PKLs + independent, validated geometry labels.
+    geometry_overlay: /root/code/vepfs/dataset/hand_recon_hug/dexycb_native_overlay_v1
     datasets:
       # - path: /root/code/vepfs/dataset/hand_recon_hug/ho3d
       #   train_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_train.clean.txt
@@ -64,51 +71,38 @@ trainer:
     query_max_depth: 2.0
     query_depth_cluster_width: 0.12
     # ---- 尺度自适应手部局部输入 ----
-    # Oracle B v26：完整 RGB 上 train 用 GT bbox、val/test 用 detector bbox；Depth 按关键点圆形 ROI 裁剪。
-    # GT 关键点变换到 RGB crop 坐标后供 skeleton condition 使用；原全图坐标的
-    # GT 关键点同时定义 Depth 圆形 ROI，用于隔离 MediaPipe 漏检/抖动的影响。
-    # affine 增强先同步作用于全图 RGB/Depth/关键点/query/K；之后 RGB bbox crop
-    # 再单独得到 K_rgb=A_crop@K_full，Depth 保持增强后的全图坐标系与 K_full。
-    # 训练保持 Oracle GT；val/test 使用 detector crop + RTMPose-m Hand5，
-    # 从而让训练监督和真实部署评测来源显式分离。
+    # train 使用 GT joints 生成 RGB crop；val/test 保留部署 detector crop，但 skeleton、
+    # Depth ROI 和 palm anchor 全部使用 GT joints。整个实验不调用 RTMPose。
+    # affine 仅作用于 train，并同步变换 RGB/Depth/GT joints/query/K；val/test 保持干净。
+
     hand_crop:
       enabled: true
       expand: 1.5
       # 深度圆形裁剪半径 = 关键点到中心最大距离 * 1.25。
       depth_radius_expand: 1.25
+      depth_detector_expand: 1.15
       detector_weights: /root/code/vepfs/GPGFormer/weights/detector.pt
       detector_conf: 0.25
       detector_iou: 0.7
       # eval_test 的每个 DDP rank 使用自己的当前 GPU，避免 CPU detector 成为瓶颈。
       detector_device: auto
-      keypoint_source: gt             # 兼容旧代码/旧配置的回退值
+      keypoint_source: gt
       train_keypoint_source: gt
-      eval_keypoint_source: rtmpose
-      mediapipe_enabled: true
-      mediapipe_min_detection_confidence: 0.3
-      rtmpose_config: /root/code/vepfs/third_party/mmpose-1.3.2/configs/hand_2d_keypoint/rtmpose/hand5/rtmpose-m_8xb256-210e_hand5-256x256.py
-      rtmpose_checkpoint: /root/code/vepfs/HUG-for-Recon-Gen/rtmpose/rtmpose-m-hand5-256x256.pth
-      rtmpose_device: auto
-      # benchmark 显示均值阈值会明显损失正确样本覆盖；仅过滤极低分单点。
-      rtmpose_min_joint_confidence: 0.1
-      rtmpose_min_mean_confidence: 0.0
-      # HUG 环境保留原依赖，仅从本地 pose 环境补 OpenMMLab 包。
-      rtmpose_python_paths:
-        - /root/code/vepfs/miniconda3/envs/pose/lib/python3.10/site-packages
-        - /root/code/vepfs/third_party/mmpose-1.3.2
-    # Metric sensor/PCL augmentation; val/test remain clean and deterministic.
+      eval_keypoint_source: gt
+      # GT oracle 实验不随机移除 skeleton。
+      skeleton_drop_prob: 0.0
+    # 仅 train 启用；val/test 在 AugmentedGraspDataset 中保持干净、确定性输入。
     augmentation:
-      enabled: false
-      # DINOv2 is frozen and train/val are same-domain; keep RGB clean while
-      # measuring the geometry changes below.
-      color_scale: 0.0
-      brightness_delta: 0.0
-      brightness_prob: 0.0
-      contrast_min: 1.0
-      contrast_max: 1.0
-      contrast_prob: 0.0
+      enabled: true
+      # 与 random20 可视化一致的轻量 photometric 范围。
+      color_scale: 0.10
+      brightness_delta: 0.05
+      brightness_prob: 0.80
+      contrast_min: 0.90
+      contrast_max: 1.10
+      contrast_prob: 0.80
       depth:
-        enabled: false
+        enabled: true
         probability: 0.50
         gaussian_std: [0.001, 0.003]
         pixel_dropout_prob: [0.0, 0.03]
@@ -119,22 +113,27 @@ trainer:
         outlier_probability: [0.0, 0.005]
         outlier_delta: 0.020
       pointcloud:
-        enabled: false
+        enabled: true
         probability: 0.50
         jitter_std: [0.0, 0.001]
         dropout_ratio: [0.0, 0.10]
         region_dropout_probability: 0.20
         region_radius: [0.01, 0.04]
       affine:
-        enabled: false
-    norm_stats_file: /root/code/HUG-for-Recon-Gen/assets/norm_stats_dexycb_109d.json
+        enabled: true
+        probability: 0.60
+        scale_factor: 0.15
+        rotation_deg: 15.0
+        translation_frac: 0.08
+        min_visible_landmarks: 0.95
+    norm_stats_file: /root/code/vepfs/dataset/hand_recon_hug/dexycb_native_overlay_v1/norm_stats.json
     n_points_input: 4096
     max_val_samples: 4096          # 从 DexYCB val 等距采样 4096 条，控制单次评估耗时
     num_workers: 16
     prefetch_factor: 4
 
   train:
-    total_steps: 25000             
+    total_steps: 25000
     batch_size: 256                # 每张卡 batch
     lr: 1.0e-4
     weight_decay: 0.0
@@ -178,15 +177,15 @@ trainer:
     heartbeat_every: 20              # 长时间 batch/val/checkpoint 前的存活事件间隔
     val_every: 1000
     ckpt_every: 1000          # 与 val_every 对齐，续训点即评估点
-    output_dir: /root/code/vepfs/HUG-for-Recon-Gen/hand_recon/20260914_v28_joint_dit
-    log_file: /root/code/vepfs/HUG-for-Recon-Gen/logs/hand_recon/20260914_v28_joint_dit.jsonl
+    output_dir: /root/code/vepfs/HUG-for-Recon-Gen/hand_recon/20260917_v31_native_rgbd_gt_aug
+    log_file: /root/code/vepfs/HUG-for-Recon-Gen/logs/hand_recon/20260917_v31_native_rgbd_gt_aug.jsonl
     tensorboard:
       enabled: true
       log_dir: tensorboard          # relative paths are created under output_dir
       flush_secs: 10
       max_queue: 10
-    pretrained: /root/code/vepfs/HUG-for-Recon-Gen/hug_checkpoint/hug_full.safetensors  # 与 v24 相同的原始 HUG 预训练初始化；保留 DexYCB norm stats
-    resume: null  # 新架构从原始 HUG 初始化；不可继承 v27 的 optimizer 续训状态
+    pretrained: /root/code/vepfs/HUG-for-Recon-Gen/hug_checkpoint/hug_full.safetensors
+    resume: null
 
   val:                            # 按用户要求：训练中直接用官方 s0_test 评测并选择 best
     max_samples: 4096             # 从完整 test 等距取固定 4096 条，跨 checkpoint 可比
@@ -200,7 +199,7 @@ trainer:
 
   test:                            # 官方测试集全量评测：torchrun -m src.eval_test --config <本配置>
     batch_size: 256                # 每卡 batch
-    out: /root/code/vepfs/HUG-for-Recon-Gen/hand_recon/20260914_v28_joint_dit/test_results_rtmpose.json
+    out: /root/code/vepfs/HUG-for-Recon-Gen/hand_recon/20260917_v31_native_rgbd_gt_aug/test_results_gt.json
     datasets:
       - name: dexycb_test          # DexYCB 官方 s0_test（MANO GT，走 sample+build_loss_dicts）
         path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v4_fullres_shape_gt

@@ -75,6 +75,16 @@ def app(
     use_rgb = getattr(model, "use_rgb", True)
     use_depth = getattr(model, "use_depth", False)
     pcl_use_rgb = getattr(model, "pcl_use_rgb", False)
+    native = getattr(model, "mano_geometry", "legacy_right") == "native_side_v1"
+    native_data = getattr(model, "inference_data_config", {})
+    native_kwargs = {}
+    if native:
+        native_kwargs = {
+            "hand_crop": native_data.get("hand_crop", {}),
+            "geometry_overlay": native_data.get("geometry_overlay"),
+        }
+        if not native_kwargs["geometry_overlay"]:
+            raise ValueError("native app inference requires the checkpoint geometry overlay")
 
     # Resolve sample names. Pkls are found recursively under dataset_path
     # (grasp_pred/ excluded), so flat and nested scene/object layouts both work;
@@ -102,6 +112,7 @@ def app(
         use_rgb=use_rgb,
         use_depth=use_depth,
         d_mano=int(getattr(model.flow, "d_mano", 99)),
+        **native_kwargs,
     )
 
     # Viser setup
@@ -175,6 +186,7 @@ def app(
         "camera_frustum": None,
         "camera_frame": None,
         "last_click_norm": None,
+        "source_is_left": None,
     }
 
     def _make_image_html(image_rgb: np.ndarray) -> str:
@@ -361,12 +373,16 @@ def app(
             )
 
         K = vis["camera_K"]
+        source_is_left = vis["source_is_left"] if native else None
+        faces = (model.mano.faces_for_side(source_is_left).cpu().numpy()
+                 if native else model.mesh_faces)
         pred_grasp = mano_params_to_grasp_dict(
             preds[0],
             model.get_betas(preds[0]),
             model.mano,
             K,
-            model.mesh_faces,
+            faces,
+            source_is_left=source_is_left,
         )
 
         point_handle = None
@@ -392,6 +408,7 @@ def app(
                 model.mano,
                 n_frames=n_frames,
                 pre_offset_m=(off, off),
+                source_is_left=source_is_left,
             )
 
         add_pred_hand(pred_grasp, point_handle=point_handle, frames=frames)
@@ -430,6 +447,7 @@ def app(
         vis["width"] = width
         vis["height"] = height
         vis["mesh_faces"] = data["mesh_faces"]
+        vis["source_is_left"] = data.get("source_is_left")
         vis["rgb_image"] = data["rgb_original"]
 
         update_gui_image()

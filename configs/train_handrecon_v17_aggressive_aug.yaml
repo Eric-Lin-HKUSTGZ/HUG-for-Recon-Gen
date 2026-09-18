@@ -12,7 +12,7 @@ trainer:
     use_2d_point: false
     use_pointpainting: true
     # ---- RGB 编码器（冻结 DINOv2）----
-    encoder_name: facebook/dinov2-with-registers-base
+    encoder_name: /root/code/vepfs/HUG-for-Recon-Gen/dinov2/hf_with_registers_base  # VEPFS 本地权重，无需联网
     # ---- 点云编码器（可训练 PointNeXt）----
     pcl_width: 64
     pcl_sa_radii: [0.025, 0.05, 0.10, 0.20]
