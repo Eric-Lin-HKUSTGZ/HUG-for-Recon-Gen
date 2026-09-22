@@ -211,7 +211,7 @@ class GraspFlowModel(nn.Module):
         )
         return cond
 
-    def mano_forward(self, mano_params, betas=None, source_is_left=None):
+    def mano_forward(self, mano_params, betas=None, source_is_left=None, joint_convention_id=None):
         """Run MANO and return landmarks + rotations in camera frame.
 
         In 109D mode the trailing ten entries are used as per-sample MANO
@@ -229,6 +229,10 @@ class GraspFlowModel(nn.Module):
         t = out["t"].unsqueeze(1)
         out["landmarks_3d"] = out["landmarks_3d"] + t
         out["vertices"] = out["vertices"] + t
+        from .native_mano import apply_joint_convention
+        out["landmarks_3d"] = apply_joint_convention(
+            out["landmarks_3d"], out["vertices"], joint_convention_id
+        )
         return out
 
     def get_betas(self, mano_params: torch.Tensor) -> torch.Tensor:
@@ -248,7 +252,7 @@ class GraspFlowModel(nn.Module):
         params_norm_pred,
         params_norm_target,
         gt_mano_params,
-        source_is_left=None, gt_joints_3d=None, gt_vertices=None,
+        source_is_left=None, gt_joints_3d=None, gt_vertices=None, joint_convention_id=None,
     ):
         """Build pred/target dicts from predicted and GT mano params."""
         native = getattr(self, "mano_geometry", "legacy_right") == "native_side_v1"
@@ -256,7 +260,9 @@ class GraspFlowModel(nn.Module):
             raise ValueError("native_side_v1 requires converted native GT, not regenerated MANO GT")
         if not native and any(v is not None for v in (source_is_left, gt_joints_3d, gt_vertices)):
             raise ValueError("native GT cannot be consumed by the legacy geometry path")
-        pred_out = self.mano_forward(pred_mano_params, source_is_left=source_is_left)
+        pred_out = self.mano_forward(
+            pred_mano_params, source_is_left=source_is_left, joint_convention_id=joint_convention_id
+        )
         preds = {
             "params_norm": params_norm_pred,
             "mano_params": pred_mano_params,
@@ -337,7 +343,7 @@ class GraspFlowModel(nn.Module):
         hand_keypoints_2d: Optional[torch.Tensor] = None,
         hand_keypoints_valid: Optional[torch.Tensor] = None,
         hand_keypoints_confidence: Optional[torch.Tensor] = None,
-        source_is_left=None, gt_joints_3d=None, gt_vertices=None,
+        source_is_left=None, gt_joints_3d=None, gt_vertices=None, joint_convention_id=None,
     ):
         """Training forward pass. Returns (preds, targets, time_weight)."""
         scene = self.encode_scene(
@@ -360,6 +366,7 @@ class GraspFlowModel(nn.Module):
             output["target"],
             gt_mano_params,
             source_is_left=source_is_left, gt_joints_3d=gt_joints_3d, gt_vertices=gt_vertices,
+            joint_convention_id=joint_convention_id,
         )
         time_weight = 1.0 - output["t"]
         return preds, targets, time_weight

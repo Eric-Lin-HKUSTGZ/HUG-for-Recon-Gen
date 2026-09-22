@@ -45,9 +45,9 @@ torchrun --nproc_per_node=4 -m src.train \
 | DexYCB（v30 base PKL） | `/root/code/vepfs/dataset/hand_recon_hug/dexycb_v4_fullres_shape_gt` | 394,193 | 21,785 | 76,845（s0_test） |
 | 合计 | — | **471,402** | 27,546 | **94,069** |
 
-划分清单（stem 列表，位于数据目录外的 `splits/`）：
+划分清单（stem 列表，位于数据目录外的 `splits_v2/`）：
 `/root/code/vepfs/dataset/hand_recon_hug/splits_v2/` 下
-`{ho3d,dexycb}_{train,val,test}.clean.txt` 与 `ho3d_eval.clean.txt`。目录名沿用 `splits_v2`，官方划分和 stem 清单未因 v30 改变。
+DexYCB 沿用 `dexycb_{train,val,test}.clean.txt`；HO3D 使用 `ho3d_{train,val,eval,trainval}.txt`（2026-09-20 合并更新，完整官方 eval 为 20137 帧）。
 
 - HO3D train/val：按序列（recording-level）留出验证集；test = 官方
   evaluation split（无 MANO，只有 joints/verts GT）
@@ -290,7 +290,7 @@ score，创新低即保存 `model_best.pt`（等权防止被样本量大的 DexY
   （官方就不发布 MANO），`sample()` -> `mano_forward()` -> 与
   `joints_gt/verts_gt` 比对，同样四项指标。两条路径按 batch 内有无
   `mano_params` 字段自动切换
-- 清单：`splits/dexycb_test.clean.txt` / `splits/ho3d_eval.clean.txt`
+- 清单：`splits_v2/dexycb_test.clean.txt` / `splits_v2/ho3d_eval.txt`
   （`make_handrecon_splits.py` + `filter_empty_masks.py --lists
   dexycb_test,ho3d_eval` 生成，剔除规则见第 2 节）
 - 多卡分片：`torchrun --nproc_per_node=N`，指标经 all_reduce 聚合
@@ -465,3 +465,36 @@ trainer.train.resume 中替换路径；trainer.train.total_steps 表示目标总
 - HO3D 评估集（`--split evaluation` 产物）无 MANO 标注、无分割 mask，
   不在训练 loop 内，只用于第 4b 节的推理评测（`GraspDataset` 对空
   `object_mask` 已做兼容：有 `condition_point` 就不解码 mask）。
+
+
+## HO3D native 全分辨率重新转换（2026-09-19）
+
+新流程、逐步人工执行命令和验收规则见 [docs/HO3D_RECONVERSION_V2.md](docs/HO3D_RECONVERSION_V2.md)。本节及该文档覆盖本文旧 HO3D 转换/评测输入说明；DexYCB v30+ 的 native overlay 约定不变。
+
+- 旧训练 PKL 虽含 handBeta 对应的 shape_gt，但旧 shape/几何使用 canonical beta；新转换 shape 与 shape_gt 都用真实 beta，训练网格亦使用该 beta。
+- 腕部平移必须使用随 beta 变化的 J0 偏移，并逐帧对照官方 handJoints3D；不能再复用零 shape 模板偏移。
+- HO3D 官方五个指尖为顶点 [744,333,444,555,672]；新的 joint_convention_id=1 只在 HO3D 样本上切换预测取点规则，DexYCB 保持原定义，网格拓扑不变。
+- 新训练/评测目录预定为 ho3d_v2_fullres_native、ho3d_eval_v2_fullres_native，保留原图和 K，Depth 为 uint16 毫米 PNG。新文件直接携带正确几何，不挂 DexYCB overlay。
+- 官方 evaluation 没有 MANO pose/beta 标签，继续仅用官方 joints/verts 评测，不填固定 beta 作 GT；原生右手标记传入解码。官方列表有 20,137 帧，不能沿用旧 clean 的 17,224 帧删除结果作为全量官方评测。
+- 新转换不写 GT condition_point 或 GT mesh mask 作为条件。正式条件来自原图上的 detector+RTMPose 独立缓存；失败保留样本并回退全图。增强时沿用现有 affine 同步机制。
+- 数据集条目现在支持独立 geometry_overlay 和 hand_crop 覆盖；HO3D 显式设 geometry_overlay: null，并指定自己的缓存与 train/eval keypoint source，避免继承 v32 GT oracle 设置。
+- 此次仅 CPU 小样本转换/检查；全量转换和正式 GPU 缓存由人工按文档执行。新旧数据不可直接逐分数比较，必须记录样本集合和 GT/预测关键点口径。
+
+
+## HO3D 正式训练日志路径修正（2026-09-20）
+
+`configs/train_ho3d.yaml` 的结构化训练日志固定写入：
+`/root/code/vepfs/HUG-for-Recon-Gen/logs/hand_recon/ho3dv3_native_rgbd_rtmpose_aug_lora.jsonl`。
+训练输出目录仍保存 checkpoint、配置副本和 rank 日志；JSONL 主监控文件不再只放在 checkpoint 子目录。当前已经运行的进程是按旧路径启动的，两个路径通过同一文件 inode 保持实时同步；下次从新配置启动会直接写入指定监控路径。
+
+实时查看：
+
+```bash
+tail -f /root/code/vepfs/HUG-for-Recon-Gen/logs/hand_recon/ho3dv3_native_rgbd_rtmpose_aug_lora.jsonl
+```
+
+## HO3Dv3 真实缓存训练链路验收（2026-09-20）
+
+划分现统一到 `splits_v2`，HO3D 使用不带 `.clean` 的四份列表，旧 `splits` 与独立 HO3D 划分目录已移除。DexYCB 列表内容保持不变。当前 HO3D 训练入口 `configs/train_ho3d.yaml` 已替换旧 99D 配置，使用 native 109D、新全分辨率数据、真实 detector/RTMPose 缓存、v32 增强与 LoRA；不继承 GT oracle 条件。官方 evaluation 用于训练中的 checkpoint 选择和最终测试；这是 test-selection protocol，不是独立测试。
+
+已完成四卡 6 步 smoke、两次验证和 checkpoint 保存、EMA checkpoint 独立官方 eval 子集推理；所有 loss/梯度/指标有限，LoRA 与 shape head 更新确认。全量训练尚未启动。完整路径、复现命令及验收结果见 [docs/HO3D_SMOKE_20260920.md](docs/HO3D_SMOKE_20260920.md)。小样本指标不代表最终模型性能。

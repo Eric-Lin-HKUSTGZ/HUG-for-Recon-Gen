@@ -32,7 +32,7 @@ from torch.utils.data import DataLoader, Sampler
 from .dataloader.grasp_dataset import GraspDataset
 from .metrics import joint_mesh_errors
 from .models.grasp_model import GraspFlowModel
-from .models.native_mano import geometry_kwargs_from_batch
+from .models.native_mano import geometry_kwargs_from_batch, prediction_geometry_kwargs_from_batch
 from .train import is_main, setup_ddp
 
 console = Console()
@@ -131,7 +131,7 @@ def evaluate_dataset(
                         targets["vertices"].float(),
                     )
                 else:  # joints/verts GT only (HO3D_v3 evaluation split)
-                    pred_out = model.mano_forward(samples)
+                    pred_out = model.mano_forward(samples, **prediction_geometry_kwargs_from_batch(batch, device))
                     errs = joint_mesh_errors(
                         pred_out["landmarks_3d"].float(),
                         batch["joints_gt"].to(device).float(),
@@ -236,10 +236,16 @@ def main(
     for entry in test_cfg.datasets:
         if wanted is not None and entry.name not in wanted:
             continue
+        entry_common = dict(common)
+        if "geometry_overlay" in entry:
+            entry_common["geometry_overlay"] = entry.geometry_overlay
+        if "hand_crop" in entry:
+            entry_common["hand_crop"] = dict(common["hand_crop"])
+            entry_common["hand_crop"].update(dict(entry.hand_crop))
         ds = GraspDataset(
             str(entry.path),
             samples_filename=str(entry.samples) if entry.get("samples") else None,
-            **common,
+            **entry_common,
         )
         if limit is not None:
             ds.grasp_files = ds.grasp_files[: int(limit)]
@@ -255,7 +261,7 @@ def main(
             shuffle=False,
             num_workers=(
                 0
-                if bool(cfg.trainer.data.get("hand_crop", {}).get("enabled", False))
+                if ds.hand_crop_enabled
                 else cfg.trainer.data.num_workers
             ),
             pin_memory=True,
@@ -265,6 +271,8 @@ def main(
         results[entry.name] = evaluate_dataset(
             entry.name, model, loader, device, rank, world_size, bf16, steps=steps
         )
+        results[entry.name]["eval_keypoint_source"] = ds.keypoint_source
+        results[entry.name]["condition_cache"] = ds.condition_cache_path
         if world_size > 1:
             torch.distributed.barrier()
 
@@ -297,13 +305,10 @@ def main(
             "sampling_steps": int(
                 steps or cfg.trainer.model.get("sampling_steps", 50)
             ),
-            "eval_keypoint_source": str(
-                cfg.trainer.data.get("hand_crop", {}).get(
-                    "eval_keypoint_source",
-                    cfg.trainer.data.get("hand_crop", {}).get(
-                        "keypoint_source", "mediapipe"
-                    ),
-                )
+            "eval_keypoint_source": (
+                next(iter({r["eval_keypoint_source"] for r in results.values()}))
+                if len({r["eval_keypoint_source"] for r in results.values()}) == 1
+                else "mixed; see per-dataset results"
             ),
             "results": results,
         }

@@ -28,10 +28,7 @@ DATASETS = {
         ROOT / "dexycb_v2_canonical_right",
         ROOT / "splits_v2/dexycb_train.clean.txt",
     ),
-    "ho3d": (
-        ROOT / "ho3d",
-        ROOT / "splits_v2/ho3d_train.clean.txt",
-    ),
+
 }
 
 CHAINS = [
@@ -269,6 +266,8 @@ def main(
     indices: str | None = None,
 ):
     """Render deterministic train-time augmentation checks for DexYCB or HO3D."""
+    if dataset in {"ho3d", "ho3d_eval"}:
+        raise ValueError("Legacy mask visualizer does not support native HO3D. Use scripts/prepare_ho3d_v2.py check or cache-check; see docs/HO3D_RECONVERSION_V2.md")
     if dataset not in DATASETS:
         raise ValueError(f"dataset must be one of {tuple(DATASETS)}")
     data_path, split_file = DATASETS[dataset]

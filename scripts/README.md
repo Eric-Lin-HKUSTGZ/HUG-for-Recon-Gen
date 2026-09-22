@@ -124,7 +124,7 @@ python scripts/validate_dexycb_conversion.py \
 python scripts/compute_norm_stats.py \
     --data-dirs /root/code/vepfs/dataset/hand_recon_hug/ho3d \
                 /root/code/vepfs/dataset/hand_recon_hug/dexycb_v2_canonical_right \
-    --split-files /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_train.clean.txt \
+    --split-files /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_train.txt \
                   /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_train.clean.txt \
     --out assets/norm_stats_handrecon_v2.json \
     [--max-samples-per-set 100000] [--workers 16] [--recompute]

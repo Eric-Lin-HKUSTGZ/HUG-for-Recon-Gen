@@ -57,7 +57,7 @@ from .dataloader.augmented_grasp_dataset import AugmentedGraspDataset
 from .dataloader.grasp_dataset import GraspDataset
 from .metrics import joint_mesh_errors
 from .models.grasp_model import GraspFlowModel
-from .models.native_mano import geometry_kwargs_from_batch
+from .models.native_mano import geometry_kwargs_from_batch, prediction_geometry_kwargs_from_batch
 from .utils.data_keys import NORM_STATS_FILE
 
 logger = logging.getLogger("hug.train")
@@ -376,8 +376,13 @@ def _make_dataset(
     split,
     samples_filename=None,
     indices=None,
+    dataset_entry=None,
 ):
     """Construct one dataset with augmentation scoped to training."""
+    if dataset_entry is not None:
+        overrides = {k: dataset_entry[k] for k in ("geometry_overlay", "hand_crop")
+                     if k in dataset_entry}
+        data_cfg = OmegaConf.merge(data_cfg, overrides)
     dataset_cls = _dataset_class(data_cfg)
     kwargs = dict(
         dataset_path=str(dataset_path),
@@ -427,6 +432,7 @@ def build_datasets(cfg):
                     entry.path,
                     split="train",
                     samples_filename=entry.train_samples,
+                    dataset_entry=entry,
                 )
             )
             val_parts.append(
@@ -436,6 +442,7 @@ def build_datasets(cfg):
                     entry.path,
                     split="val",
                     samples_filename=entry.val_samples,
+                    dataset_entry=entry,
                 )
             )
             logger.info(
@@ -544,6 +551,7 @@ def build_loaders(cfg, train_ds, val_ds, rank, world_size, max_train_samples=Non
                 entry.path,
                 split="val",
                 samples_filename=entry.samples,
+                dataset_entry=entry,
             )
             parts.append(ds)
         total = sum(len(p) for p in parts)
@@ -760,7 +768,7 @@ def run_val(raw_model, val_loaders, device, bf16, rank, world_size):
                             targets["vertices"].float(),
                         )
                     else:
-                        pred_out = raw_model.mano_forward(samples)
+                        pred_out = raw_model.mano_forward(samples, **prediction_geometry_kwargs_from_batch(batch, device))
                         errs = joint_mesh_errors(
                             pred_out["landmarks_3d"].float(),
                             batch["joints_gt"].to(device).float(),

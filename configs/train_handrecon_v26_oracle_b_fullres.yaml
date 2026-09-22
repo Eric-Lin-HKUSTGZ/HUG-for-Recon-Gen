@@ -46,9 +46,6 @@ trainer:
 
   data:
     datasets:
-      # - path: /root/code/vepfs/dataset/hand_recon_hug/ho3d
-      #   train_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_train.clean.txt
-      #   val_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_val.clean.txt
       - path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v4_fullres_shape_gt
         train_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_train.clean.txt
         val_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_test.clean.txt
@@ -174,9 +171,6 @@ trainer:
       - name: dexycb_s0_test_selection  # 注意：test 已参与模型选择，不再是独立盲测
         path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v4_fullres_shape_gt
         samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_test.clean.txt
-      # - name: ho3d_eval            # HO3D 官方 evaluation split（跨主体，joints/verts GT）
-      #   path: /root/code/vepfs/dataset/hand_recon_hug/ho3d_eval
-      #   samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_eval.clean.txt
 
   test:                            # 官方测试集全量评测：torchrun -m src.eval_test --config <本配置>
     batch_size: 256                # 每卡 batch
@@ -185,6 +179,3 @@ trainer:
       - name: dexycb_test          # DexYCB 官方 s0_test（MANO GT，走 sample+build_loss_dicts）
         path: /root/code/vepfs/dataset/hand_recon_hug/dexycb_v4_fullres_shape_gt
         samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/dexycb_test.clean.txt
-      # - name: ho3d_eval            # HO3D_v3 官方 evaluation split（joints/verts GT，无 MANO，走推理路径）
-      #   path: /root/code/vepfs/dataset/hand_recon_hug/ho3d_eval
-      #   samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_eval.clean.txt

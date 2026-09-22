@@ -92,4 +92,27 @@ def geometry_kwargs_from_batch(batch, device):
         return {}
     if not all(present):
         raise ValueError("incomplete native geometry batch")
-    return {k: batch[k].to(device, non_blocking=True) for k in keys}
+    result = {k: batch[k].to(device, non_blocking=True) for k in keys}
+    if "joint_convention_id" in batch:
+        result["joint_convention_id"] = batch["joint_convention_id"].to(device, non_blocking=True)
+    return result
+
+
+def prediction_geometry_kwargs_from_batch(batch, device):
+    """Geometry metadata for evaluation samples without MANO parameter GT."""
+    return {k: batch[k].to(device, non_blocking=True)
+            for k in ("source_is_left", "joint_convention_id") if k in batch}
+
+
+def apply_joint_convention(joints, vertices, convention_id):
+    """Match HO3D landmarks without changing meshes or DexYCB tip definitions."""
+    if convention_id is None:
+        return joints
+    ids = torch.as_tensor(convention_id, device=joints.device)
+    if ids.shape != (len(joints),) or ids.dtype != torch.long:
+        raise ValueError("joint_convention_id must be an int64 tensor of shape (B,)")
+    if torch.any((ids != 0) & (ids != 1)):
+        raise ValueError("unsupported joint convention (0=manotorch, 1=HO3D official)")
+    ho3d = joints.clone()
+    ho3d[:, [4, 8, 12, 16, 20]] = vertices[:, [744, 333, 444, 555, 672]]
+    return torch.where((ids == 1)[:, None, None], ho3d, joints)

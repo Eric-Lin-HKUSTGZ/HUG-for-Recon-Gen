@@ -50,17 +50,7 @@ DATASETS = {
             "test": ROOT / "splits_v2/dexycb_test.clean.txt",
         },
     ),
-    "ho3d": (
-        ROOT / "ho3d",
-        {
-            "train": ROOT / "splits/ho3d_train.clean.txt",
-            "val": ROOT / "splits/ho3d_val.clean.txt",
-        },
-    ),
-    "ho3d_eval": (
-        ROOT / "ho3d_eval",
-        {"eval": ROOT / "splits/ho3d_eval.clean.txt"},
-    ),
+
 }
 
 # 21-joint skeleton in our standard order (manotorch):
@@ -338,6 +328,8 @@ def main(
         data_path: override the converted pkl directory for the selected dataset
         split_dir: override the directory containing train/val/test stem lists
     """
+    if dataset in {"ho3d", "ho3d_eval"}:
+        raise ValueError("Legacy mask visualizer does not support native HO3D. Use scripts/prepare_ho3d_v2.py check or cache-check; see docs/HO3D_RECONVERSION_V2.md")
     default_data_path, lists = DATASETS[dataset]
     if data_path is None:
         data_path = default_data_path

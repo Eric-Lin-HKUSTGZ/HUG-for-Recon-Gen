@@ -1081,7 +1081,7 @@ class GraspDataset(Dataset):
             "depth_image": depth_image,
             "mano_shape": mano_shape,
         }
-        if grasp_data.get("schema_version") == "dexycb_native_geometry_v1":
+        if grasp_data.get("schema_version") in {"dexycb_native_geometry_v1", "ho3d_native_geometry_v1"}:
             out["source_is_left"] = grasp_data["source_mano_side"] == "left"
         if self.use_rgb:
             out["rgb"] = self.rgb_transform(Image.fromarray(rgb_np))
@@ -1096,6 +1096,9 @@ class GraspDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         grasp_path = self.grasp_files[idx]
         grasp_data = self._load_grasp_data(grasp_path)
+        if (grasp_data.get("schema_version") == "ho3d_native_geometry_v1"
+                and not self.hand_crop_enabled):
+            raise ValueError("HO3D native data requires hand_crop.enabled; no GT mask/query fallback")
         # Root-relative stem so nested layouts round-trip back to the pkl path
         # (matches app/inference resolution via dataset_path / f"{stem}.pkl").
         stem = grasp_path.relative_to(self.dataset_path).with_suffix("").as_posix()
@@ -1267,11 +1270,22 @@ class GraspDataset(Dataset):
                 self.query_min_depth <= float(point_uv[2]) <= self.query_max_depth
             ),
         }
-        # Eval pkls carry no grasp label; GT fields are train-only
+        # Joint convention is label metadata, never a conditioning token.
+        native_schema = grasp_data.get("schema_version") in {
+            "dexycb_native_geometry_v1", "ho3d_native_geometry_v1"
+        }
+        if native_schema:
+            is_ho3d = grasp_data["schema_version"] == "ho3d_native_geometry_v1"
+            if is_ho3d and (grasp_data.get("joint_convention") != "ho3d_official_v1"
+                           or grasp_data.get("source_mano_side") != "right"
+                           or grasp_data.get("canonicalization") != "none"):
+                raise ValueError("invalid HO3D native geometry metadata")
+            out["joint_convention_id"] = torch.tensor(int(is_ho3d), dtype=torch.long)
+        # Eval pkls carry no MANO label; joints/vertices remain available.
         grasp = grasp_data.get("grasp")
         if grasp is not None:
             out["mano_params"] = self._get_mano_params(grasp_data)
-            if grasp_data.get("schema_version") == "dexycb_native_geometry_v1":
+            if grasp_data.get("schema_version") in {"dexycb_native_geometry_v1", "ho3d_native_geometry_v1"}:
                 if grasp_data.get("mano_parameter_convention") != "source_beta_canonical_pose_v1":
                     raise ValueError("invalid native MANO parameter convention")
                 side = grasp_data.get("source_mano_side")
@@ -1290,6 +1304,12 @@ class GraspDataset(Dataset):
                 np.asarray(grasp["landmarks_2d"], dtype=np.float32)
             ).float()
         elif "joints_gt" in grasp_data:
+            if native_schema:
+                if self.d_mano != 109:
+                    raise ValueError("native geometry requires 109D parameters")
+                if grasp_data.get("joint_order") != "ho3d_raw":
+                    raise ValueError("HO3D eval joints must be stored in official raw order")
+                out["source_is_left"] = torch.tensor(False, dtype=torch.bool)
             # HO3D_v3 evaluation split: GT is joints/verts only, no MANO params.
             # Reorder joints from the official raw order to our standard order
             # (see HO3D_RAW_TO_STD above); verts are MANO-template-ordered

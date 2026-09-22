@@ -1,23 +1,39 @@
-# HUG 手部重建训练配置（HO3D_v3 单数据集版，验证转换 bug 修复效果）
-# 用法: torchrun --nproc_per_node=4 -m src.train --config configs/train_ho3d.yaml
-# 数据: scripts/convert_ho3d.py 修复后重转换产物
-# 注意: 使用 HO3D 专属 norm_stats（assets/norm_stats_ho3d.json），与混合版互斥
-
+# HO3Dv3 native 109D RGB-D training.
+# IMPORTANT: trainer.val intentionally uses official evaluation/test data for checkpoint selection, per experiment protocol.
 trainer:
   model:
-    # ---- 模态开关（与论文 full model 一致）----
+    fusion_activation_checkpointing: true
     use_rgb: true
     use_depth: true
     use_2d_point: false
-    use_pointpainting: true
-    # ---- RGB 编码器（冻结 DINOv2）----
-    encoder_name: /root/code/vepfs/HUG-for-Recon-Gen/dinov2/hf_with_registers_base  # VEPFS 本地权重，无需联网
-    # ---- 点云编码器（可训练 PointNeXt）----
+    use_pointpainting: false
+    encoder_name: /root/code/vepfs/HUG-for-Recon-Gen/dinov2/hf_with_registers_base
+    image_encoder_tuning:
+      mode: lora
+      layers:
+      - 8
+      - 9
+      - 10
+      - 11
+      target_modules:
+      - query
+      - value
+      rank: 8
+      alpha: 16
+      dropout: 0.05
+      activation_checkpointing: true
     pcl_width: 64
-    pcl_sa_radii: [0.025, 0.05, 0.10, 0.20]
-    pcl_blocks: [1, 2, 1, 1]
+    pcl_sa_radii:
+    - 0.025
+    - 0.05
+    - 0.1
+    - 0.2
+    pcl_blocks:
+    - 1
+    - 2
+    - 1
+    - 1
     pcl_use_rgb: true
-    # ---- 融合 ----
     d_fusion: 1024
     n_patches: 256
     fusion_layers: 4
@@ -25,61 +41,160 @@ trainer:
     patch_grid_size: 16
     image_size: 224
     fourier_scale: 1.0
+    query_fusion_mode: legacy_broadcast
+    use_query_condition: false
+    use_skeleton_condition: true
     dropout: 0.1
-    # ---- flow transformer (DiT) ----
-    d_mano: 99
+    mano_geometry: native_side_v1
+    native_left_asset: /root/code/vepfs/GPGFormer/weights/mano/MANO_LEFT.pkl
+    d_mano: 109
     d_model: 512
+    flow_joint_layers: 2
+    flow_activation_checkpointing: true
     flow_layers: 6
     flow_heads: 8
     sampling_steps: 50
-    # ---- 手比物体小：0.3m → 0.2m，让 4096 点密集覆盖手部 ----
-    pcl_crop_radius: 0.2
-
+    pcl_crop_radius: 0.3
   data:
+    geometry_overlay: null
     datasets:
-      - path: /root/code/vepfs/dataset/hand_recon_hug/ho3d
-        train_samples: /root/code/vepfs/dataset/hand_recon_hug/splits/ho3d_train.clean.txt
-        val_samples: /root/code/vepfs/dataset/hand_recon_hug/splits/ho3d_val.clean.txt
-    norm_stats_file: /root/code/HUG-for-Recon-Gen/assets/norm_stats_ho3d.json
+    - path: /root/code/vepfs/dataset/hand_recon_hug/ho3d_v2_fullres_native
+      train_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_train.txt
+      val_samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_val.txt
+    query_min_depth: 0.15
+    query_max_depth: 2.0
+    query_depth_cluster_width: 0.12
+    hand_crop:
+      enabled: true
+      expand: 1.5
+      depth_radius_expand: 1.25
+      depth_detector_expand: 1.15
+      detector_weights: /root/code/vepfs/GPGFormer/weights/detector.pt
+      detector_conf: 0.25
+      detector_iou: 0.7
+      detector_device: auto
+      keypoint_source: rtmpose_cache
+      train_keypoint_source: rtmpose_cache
+      eval_keypoint_source: rtmpose_cache
+      skeleton_drop_prob: 0.0
+      condition_cache: /root/code/vepfs/HUG-for-Recon-Gen/condition_cache/ho3d_v2/trainval/conditions.npz
+    augmentation:
+      enabled: true
+      color_scale: 0.1
+      brightness_delta: 0.05
+      brightness_prob: 0.8
+      contrast_min: 0.9
+      contrast_max: 1.1
+      contrast_prob: 0.8
+      depth:
+        enabled: true
+        probability: 0.5
+        gaussian_std:
+        - 0.001
+        - 0.003
+        pixel_dropout_prob:
+        - 0.0
+        - 0.03
+        frame_bias_probability: 0.3
+        frame_bias_max: 0.005
+        region_dropout_probability: 0.2
+        region_size:
+        - 5
+        - 20
+        outlier_probability:
+        - 0.0
+        - 0.005
+        outlier_delta: 0.02
+      pointcloud:
+        enabled: true
+        probability: 0.5
+        jitter_std:
+        - 0.0
+        - 0.001
+        dropout_ratio:
+        - 0.0
+        - 0.1
+        region_dropout_probability: 0.2
+        region_radius:
+        - 0.01
+        - 0.04
+      affine:
+        enabled: true
+        probability: 0.6
+        scale_factor: 0.15
+        rotation_deg: 15.0
+        translation_frac: 0.08
+        min_visible_landmarks: 0.95
+    norm_stats_file: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/norm_stats_ho3d_v2.json
     n_points_input: 4096
+    max_val_samples: 4096
     num_workers: 16
     prefetch_factor: 4
-
   train:
-    total_steps: 25000             # 预训练权重 finetune；HO3D 单数据集 77k 帧，25k 步 ≈ 260 epoch，val 曲线可观察过拟合，需要可降到 12k
-    batch_size: 200                # 每张卡 batch
-    lr: 1.0e-4
+    total_steps: 25000
+    batch_size: 256
+    lr: 0.0001
+    image_encoder_lr: 5.0e-05
+    image_encoder_weight_decay: 0.0
     weight_decay: 0.0
-    betas: [0.9, 0.999]
+    betas:
+    - 0.9
+    - 0.999
     warmup_steps: 2500
-    lr_min_ratio: 0.0              # warmup 后 cosine 衰减到 lr * lr_min_ratio
+    lr_min_ratio: 0.0
     grad_clip: 1.0
     lambda_v: 1.0
     lambda_3d: 20.0
-    lambda_2d: 1.0                 # 2D 重投影损失权重
+    lambda_mesh_3d: 10.0
+    lambda_joint_local: 0.0
+    lambda_vertex_local: 0.0
+    lambda_theta: 0.0
+    lambda_bone_direction: 0.0
+    lambda_bone_ratio: 0.0
+    lambda_shape_x0: 0.0
+    lambda_2d: 0.0
+    lambda_translation: 0.0
+    lambda_rotation: 0.0
     ema_start_step: 12500
     ema_decay: 0.999
     bf16: true
     seed: 42
     log_every: 20
+    heartbeat_every: 20
     val_every: 1000
     ckpt_every: 1000
-    output_dir: /root/code/vepfs/HUG-for-Recon-Gen/hand_recon/20260830_v3_ho3d
-    log_file: /root/code/vepfs/HUG-for-Recon-Gen/logs/hand_recon/20260830_v3_ho3d.jsonl
+    output_dir: /root/code/vepfs/HUG-for-Recon-Gen/hand_recon/ho3dv3_native_rgbd_rtmpose_aug_lora
+    log_file: /root/code/vepfs/HUG-for-Recon-Gen/logs/hand_recon/ho3dv3_native_rgbd_rtmpose_aug_lora.jsonl
+    tensorboard:
+      enabled: true
+      log_dir: tensorboard
+      flush_secs: 10
+      max_queue: 10
     pretrained: /root/code/vepfs/HUG-for-Recon-Gen/hug_checkpoint/hug_full.safetensors
     resume: null
-
-  val:                            # 训练中验证/选型集（真实采样指标，无 loss）
+  val:
     max_samples: 4096
     datasets:
-      - name: ho3d_eval            # HO3D 官方 evaluation split（跨主体，joints/verts GT）
-        path: /root/code/vepfs/dataset/hand_recon_hug/ho3d_eval
-        samples: /root/code/vepfs/dataset/hand_recon_hug/splits/ho3d_eval.clean.txt
-
-  test:                            # 官方测试集全量评测：torchrun -m src.eval_test --config <本配置>
+    - name: ho3d_eval_selection
+      path: /root/code/vepfs/dataset/hand_recon_hug/ho3d_eval_v2_fullres_native
+      samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_eval.txt
+      geometry_overlay: null
+      hand_crop:
+        enabled: true
+        keypoint_source: rtmpose_cache
+        train_keypoint_source: rtmpose_cache
+        eval_keypoint_source: rtmpose_cache
+        condition_cache: /root/code/vepfs/HUG-for-Recon-Gen/condition_cache/ho3d_v2/evaluation/conditions.npz
+  test:
     batch_size: 256
-    out: null                      # 默认 <output_dir>/test_results.json
+    out: /root/code/vepfs/HUG-for-Recon-Gen/hand_recon/ho3dv3_native_rgbd_rtmpose_aug_lora/test_results.json
     datasets:
-      - name: ho3d_eval
-        path: /root/code/vepfs/dataset/hand_recon_hug/ho3d_eval
-        samples: /root/code/vepfs/dataset/hand_recon_hug/splits/ho3d_eval.clean.txt
+    - name: ho3d_eval
+      path: /root/code/vepfs/dataset/hand_recon_hug/ho3d_eval_v2_fullres_native
+      samples: /root/code/vepfs/dataset/hand_recon_hug/splits_v2/ho3d_eval.txt
+      geometry_overlay: null
+      hand_crop:
+        enabled: true
+        keypoint_source: rtmpose_cache
+        eval_keypoint_source: rtmpose_cache
+        condition_cache: /root/code/vepfs/HUG-for-Recon-Gen/condition_cache/ho3d_v2/evaluation/conditions.npz
